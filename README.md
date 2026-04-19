@@ -1,9 +1,9 @@
 # RAMP
 
-[![Build](https://github.com/YOUR_USERNAME/ramp/actions/workflows/release.yml/badge.svg)](https://github.com/YOUR_USERNAME/ramp/actions/workflows/release.yml)
+[![Build](https://github.com/rbenzing/RAMP/actions/workflows/release.yml/badge.svg)](https://github.com/rbenzing/RAMP/actions/workflows/release.yml)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
-[![Platform](https://img.shields.io/badge/platform-Windows%20x64-lightgrey)](https://github.com/YOUR_USERNAME/ramp/releases)
-[![Release](https://img.shields.io/github/v/release/YOUR_USERNAME/ramp)](https://github.com/YOUR_USERNAME/ramp/releases/latest)
+[![Platform](https://img.shields.io/badge/platform-Windows%20x64-lightgrey)](https://github.com/rbenzing/RAMP/releases)
+[![Release](https://img.shields.io/github/v/release/rbenzing/RAMP)](https://github.com/rbenzing/RAMP/releases/latest)
 [![Rust](https://img.shields.io/badge/rust-2021%20edition-orange)](https://www.rust-lang.org)
 
 **RAMP** is a deterministic local development stack manager for Windows x64. It orchestrates Apache and MySQL through a formally defined state machine — no race conditions, no orphaned processes, no partial config writes.
@@ -39,7 +39,7 @@
 
 ### 1. Download the release binary
 
-Grab `ramp.exe` from the [latest release](https://github.com/YOUR_USERNAME/ramp/releases/latest) and place it at:
+Grab `ramp.exe` from the [latest release](https://github.com/YOUR_USERNAME/RAMP/releases/latest) and place it at:
 
 ```
 C:\ramp\ramp.exe
