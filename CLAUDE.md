@@ -4,19 +4,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-RAMP is a **Rust-based Windows x86-64 local development stack manager** (Apache + MySQL + PHP). The repository currently contains specification documents only — no implementation code exists yet. Read `SPEC.md`, `BRIEF.md`, and `AGENTS.md` before starting any implementation work.
+RAMP is a **Rust-based Windows x86-64 local development stack manager** (Apache + MySQL). Implementation is complete. Read `SPEC.md`, `BRIEF.md`, and `AGENTS.md` before making changes.
 
 ## Commands
 
-These are the expected commands once the Rust implementation exists:
-
 - **Build:** `cargo build --release`
 - **Test (all):** `cargo test`
-- **Test (single):** `cargo test <test_name>` or `cargo test --test <integration_test_file>`
+- **Test (single):** `cargo test <test_name>` (e.g. `cargo test reducer::tests::stopped_start`)
 - **Lint:** `cargo clippy -- -D warnings`
 - **Format check:** `cargo fmt -- --check`
 - **Format fix:** `cargo fmt`
 - **Run:** `cargo run`
+
+All three must pass before committing: `cargo clippy -- -D warnings && cargo fmt -- --check && cargo test`
 
 Prefer single-test runs during iteration (`cargo test reducer::tests::test_name`). Full suite is for final verification.
 
@@ -110,3 +110,21 @@ desired_state.mysql: DesiredServiceState
 ```
 
 `desired_state` is persisted; runtime state is ephemeral. On startup, restore desired state then reconcile with actual system state.
+
+## Source Layout
+
+| File | Role |
+|------|------|
+| `src/state.rs` | All types: `AppState`, `ServiceState`, `RampConfig`, constants |
+| `src/events.rs` | `Event` and `SideEffect` enums |
+| `src/reducer.rs` | Pure reducer function + all Layer 1 unit tests |
+| `src/executor.rs` | Translates `SideEffect`s into I/O; owns process/thread handles |
+| `src/process.rs` | Windows Job Object spawn/kill |
+| `src/health.rs` | Apache HTTP + MySQL TCP readiness/health checks |
+| `src/config.rs` | `ramp.toml` load/validate + atomic write helper |
+| `src/paths.rs` | Install directory contract + path validation |
+| `src/logger.rs` | Bounded ring buffer for log lines |
+| `src/tray.rs` | Windows system tray (tray-item crate) |
+| `src/ui.rs` | egui window (service status, start/stop, log tail) |
+| `src/main.rs` | Entrypoint: wires event loop thread, tray thread, egui main thread |
+| `assets/icon.ico` | System tray icon |
