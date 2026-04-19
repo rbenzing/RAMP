@@ -3,6 +3,11 @@ name = "ramp"
 version = "1.0.0"
 edition = "2021"
 description = "Deterministic local dev stack manager for Windows (Apache + MySQL)"
+license = "GPL-3.0-only"
+repository = "https://github.com/YOUR_USERNAME/ramp"
+readme = "README.md"
+keywords = ["windows", "apache", "mysql", "devtools", "stack"]
+categories = ["development-tools"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

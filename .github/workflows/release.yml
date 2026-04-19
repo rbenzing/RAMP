@@ -1,0 +1,121 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  pull_request:
+    branches:
+      - master
+      - main
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Check: runs on every PR and tag ──────────────────────────────────────
+  check:
+    name: Lint & Test
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy -- -D warnings
+
+      - name: Run tests
+        run: cargo test
+
+  # ── Release: only on version tags ────────────────────────────────────────
+  release:
+    name: Build Release Binary
+    runs-on: windows-latest
+    needs: check
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Rename binary with version
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}"
+          $src = "target\release\ramp.exe"
+          $dst = "ramp-${version}-windows-x64.exe"
+          Copy-Item $src $dst
+          Write-Host "Created: $dst"
+
+      - name: Generate SHA-256 checksum
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}"
+          $file = "ramp-${version}-windows-x64.exe"
+          $hash = (Get-FileHash $file -Algorithm SHA256).Hash.ToLower()
+          "$hash  $file" | Out-File -Encoding ascii "${file}.sha256"
+          Write-Host "SHA256: $hash"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "RAMP ${{ github.ref_name }}"
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          body: |
+            ## Installation
+
+            1. Download `ramp-${{ github.ref_name }}-windows-x64.exe` and place it at `C:\ramp\ramp.exe`
+            2. Extract [Apache 2.4 (Win64, VS17)](https://www.apachelounge.com/download/) into `C:\ramp\apache\`
+            3. Extract [MySQL 9.x (ZIP)](https://dev.mysql.com/downloads/mysql/) into `C:\ramp\mysql\`
+            4. Install [Visual C++ Redistributable 2022 x64](https://aka.ms/vs/17/release/vc_redist.x64.exe)
+            5. Run `ramp.exe` — first-launch provisioning is automatic
+
+            Verify the download with the `.sha256` file:
+            ```powershell
+            Get-FileHash ramp-${{ github.ref_name }}-windows-x64.exe -Algorithm SHA256
+            ```
+
+            See [README](https://github.com/${{ github.repository }}/blob/master/README.md) for full documentation.
+          files: |
+            ramp-${{ github.ref_name }}-windows-x64.exe
+            ramp-${{ github.ref_name }}-windows-x64.exe.sha256
