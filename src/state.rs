@@ -31,10 +31,17 @@ pub enum DesiredServiceState {
     Stopped,
 }
 
+impl DesiredServiceState {
+    pub fn default_stopped() -> Self {
+        Self::Stopped
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Service {
     Apache,
     Mysql,
+    Php,
 }
 
 impl std::fmt::Display for Service {
@@ -42,6 +49,7 @@ impl std::fmt::Display for Service {
         match self {
             Service::Apache => write!(f, "Apache"),
             Service::Mysql => write!(f, "MySQL"),
+            Service::Php => write!(f, "PHP"),
         }
     }
 }
@@ -83,16 +91,25 @@ pub struct MysqlConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhpConfig {
+    pub port: u16,
+    pub bin: PathBuf,
+    pub ini: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RampConfig {
     pub install_dir: PathBuf,
     pub apache: ApacheConfig,
     pub mysql: MysqlConfig,
+    pub php: PhpConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PortState {
     pub apache_bound: bool,
     pub mysql_bound: bool,
+    pub php_bound: bool,
 }
 
 impl PortState {
@@ -100,6 +117,7 @@ impl PortState {
         Self {
             apache_bound: false,
             mysql_bound: false,
+            php_bound: false,
         }
     }
 }
@@ -111,6 +129,7 @@ impl PortState {
 pub struct AppState {
     pub apache: ServiceStatus,
     pub mysql: ServiceStatus,
+    pub php: ServiceStatus,
     pub config: RampConfig,
     pub ports: PortState,
 }
@@ -120,6 +139,7 @@ impl AppState {
         Self {
             apache: ServiceStatus::new(),
             mysql: ServiceStatus::new(),
+            php: ServiceStatus::new(),
             config,
             ports: PortState::new(),
         }
@@ -129,6 +149,7 @@ impl AppState {
         match svc {
             Service::Apache => &self.apache,
             Service::Mysql => &self.mysql,
+            Service::Php => &self.php,
         }
     }
 
@@ -136,6 +157,7 @@ impl AppState {
         match svc {
             Service::Apache => &mut self.apache,
             Service::Mysql => &mut self.mysql,
+            Service::Php => &mut self.php,
         }
     }
 }
@@ -145,6 +167,8 @@ impl AppState {
 pub struct PersistedState {
     pub apache_desired: DesiredServiceState,
     pub mysql_desired: DesiredServiceState,
+    #[serde(default = "DesiredServiceState::default_stopped")]
+    pub php_desired: DesiredServiceState,
 }
 
 impl PersistedState {
@@ -152,6 +176,7 @@ impl PersistedState {
         Self {
             apache_desired: DesiredServiceState::Stopped,
             mysql_desired: DesiredServiceState::Stopped,
+            php_desired: DesiredServiceState::Stopped,
         }
     }
 }
@@ -167,6 +192,7 @@ pub fn retry_delay(retry_count: u32) -> Option<Duration> {
 
 pub const APACHE_READY_TIMEOUT: Duration = Duration::from_secs(3);
 pub const MYSQL_READY_TIMEOUT: Duration = Duration::from_secs(5);
+pub const PHP_READY_TIMEOUT: Duration = Duration::from_secs(5);
 pub const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 pub const HEALTH_FAIL_THRESHOLD: u32 = 3;
 #[allow(dead_code)]

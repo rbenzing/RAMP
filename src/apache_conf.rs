@@ -32,10 +32,9 @@ LoadModule negotiation_module modules/mod_negotiation.so
 LoadModule alias_module modules/mod_alias.so
 LoadModule socache_shmcb_module modules/mod_socache_shmcb.so
 
-# PHP via FastCGI (mod_fcgid or PHP-FPM) — enable when PHP is configured
-# LoadModule fcgid_module modules/mod_fcgid.so
-# LoadModule proxy_module modules/mod_proxy.so
-# LoadModule proxy_fcgi_module modules/mod_proxy_fcgi.so
+# PHP via mod_proxy_fcgi → PHP-CGI listening on 127.0.0.1:{php_port}
+LoadModule proxy_module modules/mod_proxy.so
+LoadModule proxy_fcgi_module modules/mod_proxy_fcgi.so
 
 ServerAdmin local@localhost
 ServerName 127.0.0.1:{port}
@@ -59,6 +58,11 @@ DocumentRoot "{apache_dir}/htdocs"
     DirectoryIndex index.php index.html index.htm
 </IfModule>
 
+# Proxy .php requests to PHP-CGI FastCGI listener
+<FilesMatch "\.php$">
+    SetHandler "proxy:fcgi://127.0.0.1:{php_port}"
+</FilesMatch>
+
 # Deny .htaccess and .htpasswd access
 <Files ".ht*">
     Require all denied
@@ -76,11 +80,11 @@ LogLevel warn
     TypesConfig conf/mime.types
     AddType application/x-compress .Z
     AddType application/x-gzip .gz .tgz
-    AddType application/x-httpd-php .php
 </IfModule>
 "#,
         apache_dir = apache_dir,
         port = cfg.apache.port,
+        php_port = cfg.php.port,
     )
 }
 
@@ -114,7 +118,7 @@ pub fn ensure_htdocs(cfg: &RampConfig) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{ApacheConfig, MysqlConfig, RampConfig};
+    use crate::state::{ApacheConfig, MysqlConfig, PhpConfig, RampConfig};
     use std::path::Path;
     use tempfile::TempDir;
 
@@ -132,6 +136,11 @@ mod tests {
                 data_dir: dir.join("mysql").join("data"),
                 ini: dir.join("mysql").join("my.ini"),
             },
+            php: PhpConfig {
+                port: 9000,
+                bin: dir.join("php").join("php-cgi.exe"),
+                ini: dir.join("php").join("php.ini"),
+            },
         }
     }
 
@@ -142,6 +151,15 @@ mod tests {
         let conf = generate_httpd_conf(&cfg);
         assert!(conf.contains("Listen 127.0.0.1:8080"));
         assert!(conf.contains("ServerName 127.0.0.1:8080"));
+    }
+
+    #[test]
+    fn generates_conf_with_php_fcgi_proxy() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_cfg(tmp.path());
+        let conf = generate_httpd_conf(&cfg);
+        assert!(conf.contains("proxy:fcgi://127.0.0.1:9000"));
+        assert!(conf.contains("mod_proxy_fcgi.so"));
     }
 
     #[test]

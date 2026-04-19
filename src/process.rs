@@ -83,8 +83,8 @@ pub fn spawn_service(
     }
 
     // Spawn with sanitized environment, explicit working directory, absolute binary path
-    let mut child = std::process::Command::new(&bin)
-        .args(&args)
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.args(&args)
         .current_dir(&work_dir)
         .env_clear()
         .env(
@@ -94,14 +94,21 @@ pub fn spawn_service(
         .env(
             "TEMP",
             std::env::var("TEMP").unwrap_or_else(|_| "C:\\Windows\\Temp".into()),
-        )
-        .spawn()
-        .map_err(|e| {
-            unsafe {
-                let _ = CloseHandle(job_raw);
-            }
-            format!("spawn: {e}")
-        })?;
+        );
+
+    // PHP-CGI requires additional environment variables
+    if svc == Service::Php {
+        for (k, v) in php_env(cfg) {
+            cmd.env(k, v);
+        }
+    }
+
+    let mut child = cmd.spawn().map_err(|e| {
+        unsafe {
+            let _ = CloseHandle(job_raw);
+        }
+        format!("spawn: {e}")
+    })?;
 
     // Open the child process handle and assign it to the Job Object
     let pid = child.id();
@@ -163,5 +170,30 @@ fn service_params(svc: Service, cfg: &RampConfig) -> (PathBuf, Vec<String>, Path
             ];
             (bin, args, work_dir)
         }
+        Service::Php => {
+            let bin = cfg.php.bin.clone();
+            let work_dir = cfg.install_dir.join("php");
+            // PHP-CGI in FastCGI mode: bind to loopback on the configured port.
+            // PHP_FCGI_CHILDREN=0 lets Apache control worker count via mod_proxy_fcgi.
+            let args = vec!["-b".into(), format!("127.0.0.1:{}", cfg.php.port)];
+            (bin, args, work_dir)
+        }
     }
+}
+
+/// Extra environment variables needed by PHP-CGI.
+fn php_env(cfg: &RampConfig) -> Vec<(String, String)> {
+    vec![
+        (
+            "PHPRC".into(),
+            cfg.php
+                .ini
+                .parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        ),
+        // Prevent PHP from forking its own child workers — let Apache manage concurrency.
+        ("PHP_FCGI_CHILDREN".into(), "0".into()),
+        ("PHP_FCGI_MAX_REQUESTS".into(), "500".into()),
+    ]
 }

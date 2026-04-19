@@ -1,5 +1,5 @@
 use crate::paths::InstallPaths;
-use crate::state::{ApacheConfig, MysqlConfig, RampConfig};
+use crate::state::{ApacheConfig, MysqlConfig, PhpConfig, RampConfig};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -10,6 +10,8 @@ struct TomlRoot {
     install_dir: PathBuf,
     apache: TomlApache,
     mysql: TomlMysql,
+    #[serde(default)]
+    php: TomlPhp,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -20,6 +22,17 @@ struct TomlApache {
 #[derive(Debug, Serialize, Deserialize)]
 struct TomlMysql {
     port: u16,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TomlPhp {
+    port: u16,
+}
+
+impl Default for TomlPhp {
+    fn default() -> Self {
+        Self { port: 9000 }
+    }
 }
 
 /// Load and validate ramp.toml from install_dir.
@@ -45,6 +58,9 @@ port = 80
 
 [mysql]
 port = 3306
+
+[php]
+port = 9000
 "#,
         install_dir.display().to_string().replace('\\', "\\\\")
     );
@@ -60,8 +76,17 @@ fn validate_and_build(doc: TomlRoot, install_dir: &Path) -> Result<RampConfig, S
     if doc.mysql.port == 0 {
         return Err(format!("invalid mysql.port: {}", doc.mysql.port));
     }
+    if doc.php.port == 0 {
+        return Err(format!("invalid php.port: {}", doc.php.port));
+    }
     if doc.apache.port == doc.mysql.port {
         return Err("apache.port and mysql.port must be different".into());
+    }
+    if doc.apache.port == doc.php.port {
+        return Err("apache.port and php.port must be different".into());
+    }
+    if doc.mysql.port == doc.php.port {
+        return Err("mysql.port and php.port must be different".into());
     }
 
     Ok(RampConfig {
@@ -76,6 +101,11 @@ fn validate_and_build(doc: TomlRoot, install_dir: &Path) -> Result<RampConfig, S
             bin: paths.mysql_bin,
             data_dir: paths.mysql_data,
             ini: paths.mysql_ini,
+        },
+        php: PhpConfig {
+            port: doc.php.port,
+            bin: paths.php_bin,
+            ini: paths.php_ini,
         },
     })
 }
@@ -120,6 +150,8 @@ mod tests {
 port = 8080
 [mysql]
 port = 3306
+[php]
+port = 9000
 "#,
                 dir.display().to_string().replace('\\', "\\\\")
             ),
@@ -127,6 +159,27 @@ port = 3306
         let cfg = load_config(dir).unwrap();
         assert_eq!(cfg.apache.port, 8080);
         assert_eq!(cfg.mysql.port, 3306);
+        assert_eq!(cfg.php.port, 9000);
+    }
+
+    #[test]
+    fn load_config_defaults_php_port_when_absent() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        write_toml(
+            dir,
+            &format!(
+                r#"install_dir = "{}"
+[apache]
+port = 8080
+[mysql]
+port = 3306
+"#,
+                dir.display().to_string().replace('\\', "\\\\")
+            ),
+        );
+        let cfg = load_config(dir).unwrap();
+        assert_eq!(cfg.php.port, 9000);
     }
 
     #[test]
@@ -141,6 +194,27 @@ port = 3306
 port = 80
 [mysql]
 port = 80
+"#,
+                dir.display().to_string().replace('\\', "\\\\")
+            ),
+        );
+        assert!(load_config(dir).is_err());
+    }
+
+    #[test]
+    fn rejects_apache_php_port_clash() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        write_toml(
+            dir,
+            &format!(
+                r#"install_dir = "{}"
+[apache]
+port = 9000
+[mysql]
+port = 3306
+[php]
+port = 9000
 "#,
                 dir.display().to_string().replace('\\', "\\\\")
             ),

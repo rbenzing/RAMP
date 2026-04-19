@@ -46,6 +46,7 @@ impl eframe::App for RampApp {
 
             service_row(ui, &self.tx, Service::Apache, &state.apache);
             service_row(ui, &self.tx, Service::Mysql, &state.mysql);
+            service_row(ui, &self.tx, Service::Php, &state.php);
 
             ui.separator();
 
@@ -53,10 +54,12 @@ impl eframe::App for RampApp {
                 if ui.button("Start All").clicked() {
                     let _ = self.tx.send(Event::StartService(Service::Apache));
                     let _ = self.tx.send(Event::StartService(Service::Mysql));
+                    let _ = self.tx.send(Event::StartService(Service::Php));
                 }
                 if ui.button("Stop All").clicked() {
                     let _ = self.tx.send(Event::StopService(Service::Apache));
                     let _ = self.tx.send(Event::StopService(Service::Mysql));
+                    let _ = self.tx.send(Event::StopService(Service::Php));
                 }
             });
 

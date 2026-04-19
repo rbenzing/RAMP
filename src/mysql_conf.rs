@@ -109,7 +109,7 @@ pub fn needs_initialization(cfg: &RampConfig) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{ApacheConfig, MysqlConfig, RampConfig};
+    use crate::state::{ApacheConfig, MysqlConfig, PhpConfig, RampConfig};
     use std::path::Path;
     use tempfile::TempDir;
 
@@ -126,6 +126,11 @@ mod tests {
                 bin: dir.join("mysql").join("bin").join("mysqld.exe"),
                 data_dir: dir.join("mysql").join("data"),
                 ini: dir.join("mysql").join("my.ini"),
+            },
+            php: PhpConfig {
+                port: 9000,
+                bin: dir.join("php").join("php-cgi.exe"),
+                ini: dir.join("php").join("php.ini"),
             },
         }
     }

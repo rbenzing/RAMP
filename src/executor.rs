@@ -138,6 +138,7 @@ impl Executor {
         let persisted = PersistedState {
             apache_desired: state.apache.desired,
             mysql_desired: state.mysql.desired,
+            php_desired: state.php.desired,
         };
         let path = self.config.install_dir.join("ramp.state");
         match serde_json::to_vec_pretty(&persisted) {
@@ -154,6 +155,7 @@ impl Executor {
         match svc {
             Service::Apache => self.config.apache.port,
             Service::Mysql => self.config.mysql.port,
+            Service::Php => self.config.php.port,
         }
     }
 }

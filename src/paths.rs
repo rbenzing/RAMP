@@ -14,6 +14,9 @@ pub struct InstallPaths {
     pub mysql_bin: PathBuf,
     pub mysql_data: PathBuf,
     pub mysql_ini: PathBuf,
+    pub php_bin: PathBuf,
+    pub php_ini: PathBuf,
+    pub php_logs: PathBuf,
 }
 
 impl InstallPaths {
@@ -35,6 +38,9 @@ impl InstallPaths {
             mysql_bin: root.join("mysql").join("bin").join("mysqld.exe"),
             mysql_data: root.join("mysql").join("data"),
             mysql_ini: root.join("mysql").join("my.ini"),
+            php_bin: root.join("php").join("php-cgi.exe"),
+            php_ini: root.join("php").join("php.ini"),
+            php_logs: root.join("php").join("logs"),
             root,
         })
     }

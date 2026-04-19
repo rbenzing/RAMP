@@ -1,5 +1,7 @@
 use crate::events::Event;
-use crate::state::{Service, APACHE_READY_TIMEOUT, HEALTH_CHECK_INTERVAL, MYSQL_READY_TIMEOUT};
+use crate::state::{
+    Service, APACHE_READY_TIMEOUT, HEALTH_CHECK_INTERVAL, MYSQL_READY_TIMEOUT, PHP_READY_TIMEOUT,
+};
 use crossbeam_channel::Sender;
 use std::io::Read;
 use std::net::TcpStream;
@@ -34,11 +36,21 @@ pub fn check_mysql_ready(port: u16) -> bool {
     }
 }
 
+/// Check if PHP-CGI is ready: TCP connect to its FastCGI port succeeds.
+pub fn check_php_ready(port: u16) -> bool {
+    TcpStream::connect_timeout(
+        &format!("127.0.0.1:{port}").parse().unwrap(),
+        Duration::from_secs(2),
+    )
+    .is_ok()
+}
+
 /// Poll for service readiness up to the timeout. Emits ProcessReady or ProcessExit (timeout).
 pub fn poll_until_ready(svc: Service, port: u16, tx: Sender<Event>) {
     let timeout = match svc {
         Service::Apache => APACHE_READY_TIMEOUT,
         Service::Mysql => MYSQL_READY_TIMEOUT,
+        Service::Php => PHP_READY_TIMEOUT,
     };
     let deadline = Instant::now() + timeout;
     let poll_interval = Duration::from_millis(200);
@@ -47,6 +59,7 @@ pub fn poll_until_ready(svc: Service, port: u16, tx: Sender<Event>) {
         let ready = match svc {
             Service::Apache => check_apache_ready(port),
             Service::Mysql => check_mysql_ready(port),
+            Service::Php => check_php_ready(port),
         };
         if ready {
             let _ = tx.send(Event::ProcessReady(svc));
@@ -76,6 +89,7 @@ pub fn run_health_checker(
                 let ok = match svc {
                     Service::Apache => check_apache_ready(port),
                     Service::Mysql => check_mysql_ready(port),
+                    Service::Php => check_php_ready(port),
                 };
                 let event = if ok {
                     Event::HealthCheckPass(svc)

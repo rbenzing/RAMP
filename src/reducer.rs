@@ -279,7 +279,7 @@ pub fn reducer(mut state: AppState, event: Event) -> (AppState, Vec<SideEffect>)
 
         // ── Shutdown all ─────────────────────────────────────────────────────
         Event::ShutdownAll => {
-            for svc in [Service::Apache, Service::Mysql] {
+            for svc in [Service::Apache, Service::Mysql, Service::Php] {
                 match state.service(svc).state {
                     ServiceState::Running | ServiceState::Starting => {
                         state.service_mut(svc).state = ServiceState::Stopping;
@@ -306,7 +306,10 @@ pub fn reducer(mut state: AppState, event: Event) -> (AppState, Vec<SideEffect>)
 mod tests {
     use super::*;
     use crate::events::Event;
-    use crate::state::*;
+    use crate::state::{
+        ApacheConfig, AppState, DesiredServiceState, MysqlConfig, PhpConfig, RampConfig, Service,
+        ServiceState,
+    };
 
     fn make_state() -> AppState {
         let config = RampConfig {
@@ -321,6 +324,11 @@ mod tests {
                 bin: std::path::PathBuf::from("C:\\ramp\\mysql\\bin\\mysqld.exe"),
                 data_dir: std::path::PathBuf::from("C:\\ramp\\mysql\\data"),
                 ini: std::path::PathBuf::from("C:\\ramp\\mysql\\my.ini"),
+            },
+            php: PhpConfig {
+                port: 9000,
+                bin: std::path::PathBuf::from("C:\\ramp\\php\\php-cgi.exe"),
+                ini: std::path::PathBuf::from("C:\\ramp\\php\\php.ini"),
             },
         };
         AppState::new(config)
@@ -555,15 +563,31 @@ mod tests {
         let mut state = make_state();
         set_state(&mut state, Service::Apache, ServiceState::Running);
         set_state(&mut state, Service::Mysql, ServiceState::Running);
+        set_state(&mut state, Service::Php, ServiceState::Running);
         let (new_state, effects) = reducer(state, Event::ShutdownAll);
         assert_eq!(new_state.apache.state, ServiceState::Stopping);
         assert_eq!(new_state.mysql.state, ServiceState::Stopping);
+        assert_eq!(new_state.php.state, ServiceState::Stopping);
         assert!(effects
             .iter()
             .any(|e| matches!(e, SideEffect::KillService(Service::Apache))));
         assert!(effects
             .iter()
             .any(|e| matches!(e, SideEffect::KillService(Service::Mysql))));
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, SideEffect::KillService(Service::Php))));
+    }
+
+    #[test]
+    fn php_service_state_machine_works() {
+        // PHP follows the same state machine as Apache/MySQL
+        let state = make_state();
+        let (new_state, effects) = reducer(state, Event::StartService(Service::Php));
+        assert_eq!(new_state.php.state, ServiceState::Starting);
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, SideEffect::SpawnService(Service::Php))));
     }
 
     #[test]

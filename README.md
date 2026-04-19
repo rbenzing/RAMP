@@ -6,7 +6,7 @@
 [![Release](https://img.shields.io/github/v/release/rbenzing/RAMP)](https://github.com/rbenzing/RAMP/releases/latest)
 [![Rust](https://img.shields.io/badge/rust-2021%20edition-orange)](https://www.rust-lang.org)
 
-**RAMP** is a deterministic local development stack manager for Windows x64. It orchestrates Apache and MySQL through a formally defined state machine — no race conditions, no orphaned processes, no partial config writes.
+**RAMP** is a deterministic local development stack manager for Windows x64. It orchestrates Apache, MySQL, and PHP through a formally defined state machine — no race conditions, no orphaned processes, no partial config writes.
 
 > Replace XAMPP or Laragon with something you can read, audit, and trust.
 
@@ -18,7 +18,7 @@
 - **Safe** — every service runs inside a Windows Job Object; killing RAMP kills the entire process tree, no zombies
 - **Observable** — all transitions logged; events are replayable for debugging
 - **Fast** — sub-second UI, Apache ready in ≤ 3 s, MySQL ready in ≤ 5 s
-- **Self-provisioning** — generates `httpd.conf`, `my.ini`, and initialises the MySQL data directory on first run
+- **Self-provisioning** — generates `httpd.conf`, `my.ini`, `php.ini`, and initialises the MySQL data directory on first run
 - **System tray** — lives quietly in the tray; full egui status window on demand
 - **Crash recovery** — automatic restart with exponential backoff (1 s → 2 s → 4 s → 8 s → Error)
 
@@ -31,6 +31,7 @@
 | Windows 10/11 x64 | Only supported platform |
 | [Apache HTTP Server 2.4 (Win64, VS17)](https://www.apachelounge.com/download/) | From Apache Lounge |
 | [MySQL 9.x Community (ZIP)](https://dev.mysql.com/downloads/mysql/) | ZIP archive, not installer |
+| [PHP 8.x Thread Safe (ZIP)](https://windows.php.net/download/) | TS x64 ZIP — required for PHP-CGI FastCGI |
 | [Visual C++ Redistributable 2022 x64](https://aka.ms/vs/17/release/vc_redist.x64.exe) | Required by Apache Lounge builds |
 
 ---
@@ -39,7 +40,7 @@
 
 ### 1. Download the release binary
 
-Grab `ramp.exe` from the [latest release](https://github.com/YOUR_USERNAME/RAMP/releases/latest) and place it at:
+Grab `ramp.exe` from the [latest release](https://github.com/rbenzing/RAMP/releases/latest) and place it at:
 
 ```
 C:\ramp\ramp.exe
@@ -59,6 +60,12 @@ Extract the MySQL ZIP so that `mysqld.exe` ends up at:
 C:\ramp\mysql\bin\mysqld.exe
 ```
 
+Extract the PHP ZIP so that `php-cgi.exe` ends up at:
+
+```
+C:\ramp\php\php-cgi.exe
+```
+
 The final layout should look like:
 
 ```
@@ -73,6 +80,10 @@ C:\ramp\
     lib\
     share\
     ...
+  php\
+    php-cgi.exe
+    ext\
+    ...
 ```
 
 ### 3. Install the Visual C++ Redistributable
@@ -83,12 +94,12 @@ Run `vc_redist.x64.exe` if you haven't already.
 
 Double-click `ramp.exe`. On first launch RAMP will:
 
-1. Generate `ramp.toml` (ports 80 + 3306)
-2. Create `apache\conf\httpd.conf`, `apache\htdocs\index.php`, `mysql\my.ini`
+1. Generate `ramp.toml` (ports 80 + 3306 + 9000)
+2. Create `apache\conf\httpd.conf`, `apache\htdocs\index.php`, `mysql\my.ini`, `php\php.ini`
 3. Run `mysqld --initialize-insecure` (~10–20 s, once only)
 4. Show the system tray icon and status window
 
-Click **Start All** to bring up both services. Apache will be at `http://127.0.0.1/` and MySQL at `127.0.0.1:3306` (root, no password).
+Click **Start All** to bring up all three services. Apache will be at `http://127.0.0.1/`, MySQL at `127.0.0.1:3306` (root, no password), and PHP-CGI will be listening on `127.0.0.1:9000` (FastCGI, proxied from Apache).
 
 ---
 
@@ -104,11 +115,14 @@ port = 80
 
 [mysql]
 port = 3306
+
+[php]
+port = 9000
 ```
 
 RAMP validates the entire file before accepting it — an invalid config is rejected completely and the last valid config is preserved. After editing, restart the affected service from the UI.
 
-> `httpd.conf` and `my.ini` are generated once and never overwritten — edit them freely for custom virtual hosts, PHP config, etc.
+> `httpd.conf`, `my.ini`, and `php.ini` are generated once and never overwritten — edit them freely for custom virtual hosts, extensions, etc.
 
 ---
 
@@ -127,10 +141,13 @@ STATE + EVENT → NEW STATE + SIDE EFFECTS
 | Logic | `reducer.rs` | Pure function — no I/O, fully unit-tested |
 | I/O | `executor.rs` | Translates `SideEffect`s into process ops and threads |
 | Processes | `process.rs` | Windows Job Object spawn/kill |
-| Health | `health.rs` | Apache HTTP + MySQL TCP readiness and health checks |
+| Health | `health.rs` | Apache HTTP + MySQL TCP + PHP TCP readiness and health checks |
 | Config | `config.rs` | `ramp.toml` load/validate + atomic write |
 | Paths | `paths.rs` | Install-dir contract, traversal rejection, symlink rejection |
 | Log | `logger.rs` | Bounded ring buffer (1 000 lines) |
+| Apache conf | `apache_conf.rs` | Generate `httpd.conf` with PHP FastCGI proxy |
+| MySQL conf | `mysql_conf.rs` | Generate `my.ini`, initialize data dir |
+| PHP conf | `php_conf.rs` | Generate `php.ini` for PHP-CGI |
 | Tray | `tray.rs` | Windows system tray |
 | UI | `ui.rs` | egui status window |
 
@@ -167,6 +184,7 @@ If `AssignProcessToJobObject` fails the service transitions directly to `Error` 
 |---|---|---|---|---|
 | Apache | HTTP GET `127.0.0.1:port/` | 200–399 + `Server: Apache` | 2 s | 3 consecutive |
 | MySQL | TCP connect + 4-byte greeting | Handshake starts | 2 s | 3 consecutive |
+| PHP | TCP connect to FastCGI port | Connection succeeds | 2 s | 3 consecutive |
 
 Three consecutive failures trigger `HEALTH_CHECK_FAIL`, which kills the service and schedules a retry.
 
@@ -176,7 +194,7 @@ Three consecutive failures trigger `HEALTH_CHECK_FAIL`, which kills the service 
 
 ```bash
 # Prerequisites: Rust stable toolchain (rustup.rs), MSVC build tools
-git clone https://github.com/YOUR_USERNAME/ramp.git
+git clone https://github.com/rbenzing/ramp.git
 cd ramp
 cargo build --release
 # Binary at target\release\ramp.exe

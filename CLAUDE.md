@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-RAMP is a **Rust-based Windows x86-64 local development stack manager** (Apache + MySQL). Implementation is complete. Read `SPEC.md`, `BRIEF.md`, and `AGENTS.md` before making changes.
+RAMP is a **Rust-based Windows x86-64 local development stack manager** (Apache + MySQL + PHP). Implementation is complete. Read `SPEC.md`, `BRIEF.md`, and `AGENTS.md` before making changes.
 
 ## Commands
 
@@ -60,6 +60,7 @@ Every service process **must** be attached to a Windows Job Object at spawn time
 
 - **Apache READY:** TCP port bound + HTTP 200–399 + Apache signature in response (timeout: 3s)
 - **MySQL READY:** TCP connect success + MySQL protocol handshake (timeout: 5s)
+- **PHP READY:** TCP connect to FastCGI port succeeds (timeout: 5s)
 
 Health checks run every 2s (TICK). Three consecutive failures → `HEALTH_CHECK_FAIL`.
 
@@ -101,12 +102,14 @@ All events must be loggable and replayable to support deterministic regression t
 ```
 services.apache: ServiceState
 services.mysql: ServiceState
+services.php: ServiceState
 config: RampConfig
 ports: PortState
 ui: UiState
 last_error: Error | null
 desired_state.apache: DesiredServiceState
 desired_state.mysql: DesiredServiceState
+desired_state.php: DesiredServiceState
 ```
 
 `desired_state` is persisted; runtime state is ephemeral. On startup, restore desired state then reconcile with actual system state.
@@ -120,7 +123,8 @@ desired_state.mysql: DesiredServiceState
 | `src/reducer.rs` | Pure reducer function + all Layer 1 unit tests |
 | `src/executor.rs` | Translates `SideEffect`s into I/O; owns process/thread handles |
 | `src/process.rs` | Windows Job Object spawn/kill |
-| `src/health.rs` | Apache HTTP + MySQL TCP readiness/health checks |
+| `src/health.rs` | Apache HTTP + MySQL TCP + PHP TCP readiness/health checks |
+| `src/php_conf.rs` | `php.ini` generation for PHP-CGI |
 | `src/config.rs` | `ramp.toml` load/validate + atomic write helper |
 | `src/paths.rs` | Install directory contract + path validation |
 | `src/logger.rs` | Bounded ring buffer for log lines |

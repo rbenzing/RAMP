@@ -6,6 +6,7 @@ mod health;
 mod logger;
 mod mysql_conf;
 mod paths;
+mod php_conf;
 mod process;
 mod reducer;
 mod state;
@@ -75,6 +76,14 @@ fn main() {
         }
     }
 
+    // 5. Generate php.ini if missing (PHP-CGI is optional — missing binary is not fatal)
+    if let Err(e) = php_conf::ensure_php_dirs(&config) {
+        log::warn!("cannot create php/logs dir: {e}");
+    }
+    if let Err(e) = php_conf::ensure_php_ini(&config) {
+        log::warn!("cannot generate php.ini: {e}");
+    }
+
     // --- Event loop setup -------------------------------------------------
 
     let persisted = load_persisted_state(&install_dir);
@@ -82,6 +91,7 @@ fn main() {
     let mut app_state = AppState::new(config.clone());
     app_state.apache.desired = persisted.apache_desired;
     app_state.mysql.desired = persisted.mysql_desired;
+    app_state.php.desired = persisted.php_desired;
 
     let shared_state = Arc::new(Mutex::new(app_state.clone()));
     let shared_state_writer = shared_state.clone();
@@ -118,7 +128,7 @@ fn main() {
         let mut last_cmd: HashMap<String, Instant> = HashMap::new();
 
         // Restore desired running services on startup
-        for svc in [Service::Apache, Service::Mysql] {
+        for svc in [Service::Apache, Service::Mysql, Service::Php] {
             if state.service(svc).desired == DesiredServiceState::Running {
                 let _ = tx_for_loop.send(Event::StartService(svc));
             }
@@ -139,6 +149,7 @@ fn main() {
 
             let apache_was = state.apache.state;
             let mysql_was = state.mysql.state;
+            let php_was = state.php.state;
 
             let (new_state, effects) = reducer(state, event);
             state = new_state;
@@ -149,6 +160,9 @@ fn main() {
             }
             if mysql_was != ServiceState::Running && state.mysql.state == ServiceState::Running {
                 executor.start_health_check(Service::Mysql);
+            }
+            if php_was != ServiceState::Running && state.php.state == ServiceState::Running {
+                executor.start_health_check(Service::Php);
             }
 
             executor.execute(effects, &state);
@@ -190,6 +204,7 @@ fn create_runtime_dirs(cfg: &crate::state::RampConfig) -> Result<(), String> {
         cfg.install_dir.join("apache").join("conf"),
         cfg.install_dir.join("mysql").join("logs"),
         cfg.mysql.data_dir.clone(),
+        cfg.install_dir.join("php").join("logs"),
     ];
     for dir in &dirs {
         std::fs::create_dir_all(dir)

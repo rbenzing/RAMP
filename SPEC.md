@@ -22,6 +22,7 @@ The system state MUST always be representable as:
 
   * apache: ServiceState
   * mysql: ServiceState
+  * php: ServiceState
 * config: RampConfig
 * ports: PortState
 * ui: UiState
@@ -30,6 +31,7 @@ The system state MUST always be representable as:
 
   * apache: DesiredServiceState
   * mysql: DesiredServiceState
+  * php: DesiredServiceState
 
 ---
 
@@ -202,6 +204,18 @@ All service processes MUST:
 
 ---
 
+## 6.3 PHP Startup
+
+1. Validate php-cgi.exe exists
+2. Pre-check FastCGI port availability
+3. Spawn php-cgi.exe -b 127.0.0.1:{port}
+4. Attach to Job Object
+5. Begin readiness checks (TCP connect)
+6. If ready → PROCESS_READY
+7. If exit → PROCESS_EXIT
+
+---
+
 # 7. SERVICE READINESS CONTRACTS
 
 ## 7.1 Apache Ready Condition
@@ -220,10 +234,17 @@ All service processes MUST:
 
 ---
 
-## 7.3 Timeout Rules
+## 7.3 PHP Ready Condition
+
+* TCP connection to FastCGI port succeeds
+
+---
+
+## 7.4 Timeout Rules
 
 * Apache: 3 seconds
 * MySQL: 5 seconds
+* PHP: 5 seconds
 
 Timeout failure triggers PROCESS_EXIT or HEALTH_CHECK_FAIL
 
