@@ -1,1 +1,13 @@
 /target
+
+# Runtime binaries and data — not committed to source control
+/apache/
+/mysql/
+/logs/
+
+# Runtime state files
+ramp.state
+ramp.toml
+
+# Build artifacts
+*.pdb

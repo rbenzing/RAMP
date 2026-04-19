@@ -145,22 +145,23 @@ fn service_params(svc: Service, cfg: &RampConfig) -> (PathBuf, Vec<String>, Path
     match svc {
         Service::Apache => {
             let bin = cfg.apache.bin.clone();
-            let work_dir = bin
-                .parent()
-                .and_then(|p| p.parent())
-                .unwrap_or(&cfg.install_dir)
-                .to_path_buf();
-            (bin, vec!["-DFOREGROUND".into()], work_dir)
+            // ServerRoot is the apache\ dir; work_dir must be there so relative log paths resolve
+            let work_dir = cfg.install_dir.join("apache");
+            let args = vec![
+                "-f".into(),
+                cfg.apache.conf.display().to_string(),
+                "-DFOREGROUND".into(),
+            ];
+            (bin, args, work_dir)
         }
         Service::Mysql => {
             let bin = cfg.mysql.bin.clone();
-            let work_dir = cfg
-                .mysql
-                .data_dir
-                .parent()
-                .unwrap_or(&cfg.install_dir)
-                .to_path_buf();
-            (bin, vec!["--console".into()], work_dir)
+            let work_dir = cfg.install_dir.join("mysql");
+            let args = vec![
+                format!("--defaults-file={}", cfg.mysql.ini.display()),
+                "--console".into(),
+            ];
+            (bin, args, work_dir)
         }
     }
 }
