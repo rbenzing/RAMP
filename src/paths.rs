@@ -28,6 +28,12 @@ impl InstallPaths {
                 root.display()
             ));
         }
+
+        // Ensure the install_dir itself (and every ancestor component we can check)
+        // is not a symlink. An attacker controlling a symlink in the base path could
+        // redirect all derived paths to an arbitrary location.
+        validate_no_symlink_in_path(&root)?;
+
         Ok(Self {
             config: root.join("ramp.toml"),
             state_file: root.join("ramp.state"),
@@ -44,6 +50,37 @@ impl InstallPaths {
             root,
         })
     }
+}
+
+/// Walk every existing ancestor of `path` and reject if any component is a symlink.
+/// This prevents an attacker from placing a symlink in the install_dir itself to
+/// redirect all derived paths (binaries, config, data) to an arbitrary location.
+fn validate_no_symlink_in_path(path: &Path) -> Result<(), String> {
+    // Collect all components from root down to (and including) path.
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(format!(
+                    "symlink detected in critical base path: {}",
+                    current.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Path doesn't exist yet — stop checking (remaining components also won't exist).
+                break;
+            }
+            Err(e) => {
+                return Err(format!(
+                    "cannot verify symlink status of {}: {e}",
+                    current.display()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Validate that a path is:
@@ -77,12 +114,25 @@ pub fn validate_critical_path(
         ));
     }
 
-    // No symlinks for critical paths
+    // No symlinks for critical paths.
+    // If symlink_metadata fails for any reason other than the path not existing,
+    // we treat it as a validation failure — never silently skip the check.
     if !allow_symlink {
-        if let Ok(meta) = std::fs::symlink_metadata(path) {
-            if meta.file_type().is_symlink() {
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(format!(
+                        "symlink not allowed for critical path: {}",
+                        path.display()
+                    ));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Path doesn't exist yet (e.g. conf generated at first run) — allow.
+            }
+            Err(e) => {
                 return Err(format!(
-                    "symlink not allowed for critical path: {}",
+                    "cannot verify symlink status of {}: {e}",
                     path.display()
                 ));
             }
@@ -120,5 +170,82 @@ mod tests {
         let base = Path::new("C:\\ramp");
         let ok = Path::new("C:\\ramp\\apache\\bin\\httpd.exe");
         assert!(validate_critical_path(ok, base, true).is_ok());
+    }
+
+    #[test]
+    fn rejects_symlink_for_critical_path() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("real.txt");
+        let link = tmp.path().join("link.txt");
+        std::fs::write(&target, b"data").unwrap();
+        // Creating symlinks on Windows requires SeCreateSymbolicLinkPrivilege
+        // or Developer Mode. Skip if unavailable (common in CI without elevation).
+        match std::os::windows::fs::symlink_file(&target, &link) {
+            Err(e) if e.raw_os_error() == Some(1314) => return, // ERROR_PRIVILEGE_NOT_HELD
+            Err(e) => panic!("unexpected symlink error: {e}"),
+            Ok(()) => {}
+        }
+
+        // validate_critical_path with allow_symlink=false must reject the symlink
+        let result = validate_critical_path(&link, tmp.path(), false);
+        assert!(
+            result.is_err(),
+            "symlink must be rejected when allow_symlink=false"
+        );
+        assert!(
+            result.unwrap_err().contains("symlink"),
+            "error message must mention symlink"
+        );
+    }
+
+    #[test]
+    fn allows_symlink_when_flag_set() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("real.txt");
+        let link = tmp.path().join("link.txt");
+        std::fs::write(&target, b"data").unwrap();
+        match std::os::windows::fs::symlink_file(&target, &link) {
+            Err(e) if e.raw_os_error() == Some(1314) => return, // ERROR_PRIVILEGE_NOT_HELD
+            Err(e) => panic!("unexpected symlink error: {e}"),
+            Ok(()) => {}
+        }
+
+        // With allow_symlink=true, the same path must pass
+        assert!(
+            validate_critical_path(&link, tmp.path(), true).is_ok(),
+            "symlink should be allowed when allow_symlink=true"
+        );
+    }
+
+    #[test]
+    fn rejects_nonexistent_but_out_of_bounds_path() {
+        // Path that doesn't exist yet but is outside install_dir
+        let base = Path::new("C:\\ramp");
+        let outside = Path::new("C:\\other\\file.txt");
+        assert!(validate_critical_path(outside, base, false).is_err());
+    }
+
+    #[test]
+    fn accepts_nonexistent_path_inside_install_dir() {
+        // Paths that don't exist yet (e.g. conf files) must be accepted
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let nonexistent = tmp.path().join("subdir").join("file.conf");
+        // File doesn't exist — validate_critical_path must accept it (no symlink check fails)
+        assert!(validate_critical_path(&nonexistent, tmp.path(), false).is_ok());
+    }
+
+    #[test]
+    fn install_paths_from_existing_dir_succeeds() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let paths = InstallPaths::from_install_dir(tmp.path());
+        assert!(paths.is_ok());
+        let p = paths.unwrap();
+        assert!(p.config.starts_with(tmp.path()));
+        assert!(p.apache_bin.starts_with(tmp.path()));
+        assert!(p.mysql_bin.starts_with(tmp.path()));
     }
 }

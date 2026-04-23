@@ -16,31 +16,35 @@ pub fn run_tray(tx: Sender<Event>, show_window_tx: crossbeam_channel::Sender<()>
     tray.add_menu_item("Open RAMP", move || {
         let _ = show_tx.send(());
     })
-    .ok();
+    .unwrap_or_else(|e| log::warn!("tray: could not add 'Open RAMP' item: {e}"));
 
-    tray.add_label("─────────────").ok();
+    tray.add_label("─────────────")
+        .unwrap_or_else(|e| log::warn!("tray: could not add separator: {e}"));
 
     let tx2 = tx.clone();
     tray.add_menu_item("Start All", move || {
         let _ = tx2.send(Event::StartService(Service::Apache));
         let _ = tx2.send(Event::StartService(Service::Mysql));
+        let _ = tx2.send(Event::StartService(Service::Php));
     })
-    .ok();
+    .unwrap_or_else(|e| log::warn!("tray: could not add 'Start All' item: {e}"));
 
     let tx3 = tx.clone();
     tray.add_menu_item("Stop All", move || {
         let _ = tx3.send(Event::StopService(Service::Apache));
         let _ = tx3.send(Event::StopService(Service::Mysql));
+        let _ = tx3.send(Event::StopService(Service::Php));
     })
-    .ok();
+    .unwrap_or_else(|e| log::warn!("tray: could not add 'Stop All' item: {e}"));
 
-    tray.add_label("─────────────").ok();
+    tray.add_label("─────────────")
+        .unwrap_or_else(|e| log::warn!("tray: could not add separator: {e}"));
 
     let tx4 = tx.clone();
     tray.add_menu_item("Exit", move || {
         let _ = tx4.send(Event::ShutdownAll);
     })
-    .ok();
+    .unwrap_or_else(|e| log::warn!("tray: could not add 'Exit' item: {e}"));
 
     // tray-item's inner loop — blocks until the tray is destroyed
     loop {

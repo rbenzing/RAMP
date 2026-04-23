@@ -1,14 +1,18 @@
 use crate::state::{RampConfig, Service};
 use crossbeam_channel::Sender;
+use std::ffi::OsStr;
+use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
-use std::process::Child;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
-use windows::Win32::System::Threading::{OpenProcess, PROCESS_ALL_ACCESS};
+use windows::Win32::System::Threading::{
+    CreateProcessW, ResumeThread, TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW,
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, INFINITE, PROCESS_INFORMATION, STARTUPINFOW,
+};
 
 use crate::events::Event;
 use crate::paths::validate_critical_path;
@@ -33,20 +37,131 @@ unsafe impl Send for JobHandle {}
 /// A running service process. Fields are pub(crate) so the executor's watcher can access them.
 pub struct ServiceProcess {
     pub job_handle: JobHandle,
-    pub child: Child,
+    /// Raw process handle (owned — we close it on drop via `CloseHandle`).
+    proc_handle: HANDLE,
+    /// Raw thread handle (owned — closed on drop).
+    thread_handle: HANDLE,
     pub service: Service,
 }
 
 impl ServiceProcess {
     /// Force-kill by closing the Job Object (kills entire process tree), then wait for cleanup.
-    pub fn kill(self) {
-        drop(self.job_handle); // KILL_ON_JOB_CLOSE terminates the tree
-        let mut child = self.child;
-        let _ = child.wait(); // reap
+    pub fn kill(mut self) {
+        // Invalidate the job handle so Drop doesn't double-close it; close it here first
+        // so KILL_ON_JOB_CLOSE fires before we wait on proc_handle.
+        let job = std::mem::take(&mut self.job_handle.0);
+        if !job.is_invalid() {
+            unsafe {
+                let _ = CloseHandle(job);
+            }
+        }
+        // Wait for the process to actually terminate before returning.
+        // This prevents the caller from assuming the process is gone when it isn't.
+        unsafe {
+            WaitForSingleObject(self.proc_handle, INFINITE);
+        }
+        // Drop runs here: closes proc_handle and thread_handle
+    }
+
+    /// Non-blocking: has the process exited? Returns exit code if so.
+    pub fn try_wait(&self) -> Option<u32> {
+        unsafe {
+            // WaitForSingleObject with 0ms timeout — returns WAIT_OBJECT_0 (0) if done.
+            if WaitForSingleObject(self.proc_handle, 0).0 == 0 {
+                let mut code: u32 = 0;
+                let _ = windows::Win32::System::Threading::GetExitCodeProcess(
+                    self.proc_handle,
+                    &mut code,
+                );
+                Some(code)
+            } else {
+                None
+            }
+        }
     }
 }
 
-/// Validate binary, spawn process, attach to Windows Job Object.
+impl Drop for ServiceProcess {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.proc_handle.is_invalid() {
+                let _ = CloseHandle(self.proc_handle);
+            }
+            if !self.thread_handle.is_invalid() {
+                let _ = CloseHandle(self.thread_handle);
+            }
+        }
+    }
+}
+
+// SAFETY: ServiceProcess is only moved between threads under controlled ownership (watcher).
+unsafe impl Send for ServiceProcess {}
+
+/// Build a null-terminated UTF-16 command line string for `CreateProcessW`.
+/// Arguments are quoted with the MSVC quoting rules (backslash-escape before `"`).
+fn build_command_line(bin: &std::path::Path, args: &[String]) -> Vec<u16> {
+    fn quote_arg(s: &str) -> String {
+        if !s.contains([' ', '\t', '"']) {
+            return s.to_owned();
+        }
+        let mut out = String::from('"');
+        let mut backslashes: usize = 0;
+        for ch in s.chars() {
+            match ch {
+                '\\' => backslashes += 1,
+                '"' => {
+                    // Double all preceding backslashes, then escape the quote.
+                    for _ in 0..backslashes {
+                        out.push('\\');
+                    }
+                    out.push('\\');
+                    out.push('"');
+                    backslashes = 0;
+                }
+                _ => {
+                    for _ in 0..backslashes {
+                        out.push('\\');
+                    }
+                    out.push(ch);
+                    backslashes = 0;
+                }
+            }
+        }
+        // Double trailing backslashes before closing quote.
+        for _ in 0..backslashes {
+            out.push('\\');
+        }
+        out.push('"');
+        out
+    }
+
+    let mut cmd = quote_arg(&bin.to_string_lossy());
+    for arg in args {
+        cmd.push(' ');
+        cmd.push_str(&quote_arg(arg));
+    }
+    OsStr::new(&cmd).encode_wide().chain(Some(0)).collect()
+}
+
+/// Build a null-terminated UTF-16 environment block for `CreateProcessW`.
+/// Format: KEY=VALUE\0KEY=VALUE\0\0
+fn build_env_block(vars: &[(String, String)]) -> Vec<u16> {
+    let mut block: Vec<u16> = Vec::new();
+    for (k, v) in vars {
+        let entry = format!("{k}={v}");
+        block.extend(OsStr::new(&entry).encode_wide());
+        block.push(0);
+    }
+    block.push(0); // double-null terminator
+    block
+}
+
+/// Validate binary, spawn process suspended, attach to Windows Job Object, then resume.
+///
+/// Using CREATE_SUSPENDED closes the race window where grandchildren could be spawned
+/// before Job Object assignment: the process cannot execute any user code until we call
+/// ResumeThread after AssignProcessToJobObject succeeds.
+///
 /// Returns Err if any step fails — caller MUST NOT start the service in that case.
 pub fn spawn_service(
     svc: Service,
@@ -66,7 +181,13 @@ pub fn spawn_service(
     let job_raw =
         unsafe { CreateJobObjectW(None, None) }.map_err(|e| format!("CreateJobObjectW: {e}"))?;
 
-    // Configure: kill all processes when the job handle is closed
+    // Configure: kill all processes when the job handle is closed.
+    // SAFETY: size_of never exceeds u32::MAX for any realistic struct.
+    let info_size = std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>();
+    assert!(
+        info_size <= u32::MAX as usize,
+        "JOBOBJECT_EXTENDED_LIMIT_INFORMATION size overflows u32"
+    );
     let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
     info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
     unsafe {
@@ -74,7 +195,7 @@ pub fn spawn_service(
             job_raw,
             JobObjectExtendedLimitInformation,
             &raw const info as *const _,
-            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            info_size as u32,
         )
         .map_err(|e| {
             let _ = CloseHandle(job_raw);
@@ -82,52 +203,62 @@ pub fn spawn_service(
         })?;
     }
 
-    // Spawn with sanitized environment, explicit working directory, absolute binary path
-    let mut cmd = std::process::Command::new(&bin);
-    cmd.args(&args)
-        .current_dir(&work_dir)
-        .env_clear()
-        .env(
-            "SystemRoot",
-            std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into()),
-        )
-        .env(
-            "TEMP",
-            std::env::var("TEMP").unwrap_or_else(|_| "C:\\Windows\\Temp".into()),
-        );
-
-    // PHP-CGI requires additional environment variables
+    // Build sanitized environment block
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
+    let temp = std::env::var("TEMP").unwrap_or_else(|_| "C:\\Windows\\Temp".into());
+    let mut env_vars: Vec<(String, String)> =
+        vec![("SystemRoot".into(), system_root), ("TEMP".into(), temp)];
     if svc == Service::Php {
-        for (k, v) in php_env(cfg) {
-            cmd.env(k, v);
-        }
+        env_vars.extend(php_env(cfg));
     }
 
-    let mut child = cmd.spawn().map_err(|e| {
+    let cmd_line = build_command_line(&bin, &args);
+    let env_block = build_env_block(&env_vars);
+
+    // Convert working directory to wide string
+    let work_dir_wide: Vec<u16> = OsStr::new(work_dir.as_os_str())
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+
+    let si = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        ..Default::default()
+    };
+    let mut pi = PROCESS_INFORMATION::default();
+
+    // Spawn suspended: no user code runs until ResumeThread.
+    // This guarantees Job Object assignment happens before any grandchildren can be spawned.
+    let created = unsafe {
+        CreateProcessW(
+            None,
+            windows::core::PWSTR(cmd_line.as_ptr() as *mut u16),
+            None,
+            None,
+            false,
+            CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+            Some(env_block.as_ptr() as *const _),
+            windows::core::PCWSTR(work_dir_wide.as_ptr()),
+            &si,
+            &mut pi,
+        )
+    };
+
+    if let Err(e) = created {
         unsafe {
             let _ = CloseHandle(job_raw);
         }
-        format!("spawn: {e}")
-    })?;
-
-    // Open the child process handle and assign it to the Job Object
-    let pid = child.id();
-    let proc_handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, false, pid) }.map_err(|e| {
-        let _ = child.kill();
-        unsafe {
-            let _ = CloseHandle(job_raw);
-        }
-        format!("OpenProcess: {e}")
-    })?;
-
-    let assign = unsafe { AssignProcessToJobObject(job_raw, proc_handle) };
-    unsafe {
-        let _ = CloseHandle(proc_handle);
+        return Err(format!("CreateProcessW: {e}"));
     }
 
+    // Assign to Job Object before resuming — the process is still suspended.
+    let assign = unsafe { AssignProcessToJobObject(job_raw, pi.hProcess) };
     if let Err(e) = assign {
-        let _ = child.kill();
         unsafe {
+            // Terminate the suspended process, close all handles.
+            let _ = TerminateProcess(pi.hProcess, 1);
+            let _ = CloseHandle(pi.hProcess);
+            let _ = CloseHandle(pi.hThread);
             let _ = CloseHandle(job_raw);
         }
         return Err(format!(
@@ -135,9 +266,15 @@ pub fn spawn_service(
         ));
     }
 
+    // Now it is safe to let the process run.
+    unsafe {
+        ResumeThread(pi.hThread);
+    }
+
     Ok(ServiceProcess {
         job_handle: JobHandle(job_raw),
-        child,
+        proc_handle: pi.hProcess,
+        thread_handle: pi.hThread,
         service: svc,
     })
 }
@@ -164,8 +301,11 @@ fn service_params(svc: Service, cfg: &RampConfig) -> (PathBuf, Vec<String>, Path
         Service::Mysql => {
             let bin = cfg.mysql.bin.clone();
             let work_dir = cfg.install_dir.join("mysql");
+            // Use to_string_lossy() for the path component. build_command_line() will
+            // apply proper MSVC quoting around the whole argument, so spaces in the
+            // path are handled safely — no shell is involved.
             let args = vec![
-                format!("--defaults-file={}", cfg.mysql.ini.display()),
+                format!("--defaults-file={}", cfg.mysql.ini.to_string_lossy()),
                 "--console".into(),
             ];
             (bin, args, work_dir)

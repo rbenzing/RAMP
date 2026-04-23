@@ -15,7 +15,7 @@ pub fn reducer(mut state: AppState, event: Event) -> (AppState, Vec<SideEffect>)
             let status = state.service(svc);
             match status.state {
                 ServiceState::Stopped | ServiceState::Error => {
-                    state.service_mut(svc).state = ServiceState::Starting;
+                    state.set_starting(svc);
                     state.service_mut(svc).desired = DesiredServiceState::Running;
                     state.service_mut(svc).retry_count = 0;
                     state.service_mut(svc).last_error = None;
@@ -26,7 +26,7 @@ pub fn reducer(mut state: AppState, event: Event) -> (AppState, Vec<SideEffect>)
                 }
                 ServiceState::Crashed => {
                     // Treat same as Stopped — reset and try again
-                    state.service_mut(svc).state = ServiceState::Starting;
+                    state.set_starting(svc);
                     state.service_mut(svc).desired = DesiredServiceState::Running;
                     state.service_mut(svc).retry_count = 0;
                     state.service_mut(svc).last_error = None;
@@ -50,6 +50,7 @@ pub fn reducer(mut state: AppState, event: Event) -> (AppState, Vec<SideEffect>)
             match status.state {
                 ServiceState::Running | ServiceState::Starting => {
                     state.service_mut(svc).state = ServiceState::Stopping;
+                    state.clear_started_at(svc);
                     state.service_mut(svc).desired = DesiredServiceState::Stopped;
                     effects.push(SideEffect::StopHealthCheck(svc));
                     effects.push(SideEffect::KillService(svc));
@@ -79,13 +80,14 @@ pub fn reducer(mut state: AppState, event: Event) -> (AppState, Vec<SideEffect>)
             match status.state {
                 ServiceState::Running | ServiceState::Starting => {
                     state.service_mut(svc).state = ServiceState::Stopping;
+                    state.clear_started_at(svc);
                     state.service_mut(svc).desired = DesiredServiceState::Running; // keep desired Running
                     effects.push(SideEffect::StopHealthCheck(svc));
                     effects.push(SideEffect::KillService(svc));
                     effects.push(SideEffect::LogEvent(format!("{svc}: restarting")));
                 }
                 ServiceState::Stopped | ServiceState::Crashed | ServiceState::Error => {
-                    state.service_mut(svc).state = ServiceState::Starting;
+                    state.set_starting(svc);
                     state.service_mut(svc).desired = DesiredServiceState::Running;
                     state.service_mut(svc).retry_count = 0;
                     state.service_mut(svc).last_error = None;
@@ -109,6 +111,7 @@ pub fn reducer(mut state: AppState, event: Event) -> (AppState, Vec<SideEffect>)
                 state.service_mut(svc).state = ServiceState::Running;
                 state.service_mut(svc).retry_count = 0;
                 state.service_mut(svc).health_fail_streak = 0;
+                state.clear_started_at(svc);
                 effects.push(SideEffect::LogEvent(format!("{svc}: ready")));
             } else {
                 effects.push(SideEffect::LogEvent(format!(
@@ -125,12 +128,13 @@ pub fn reducer(mut state: AppState, event: Event) -> (AppState, Vec<SideEffect>)
             match state.service(svc).state {
                 ServiceState::Stopping => {
                     state.service_mut(svc).state = ServiceState::Stopped;
+                    state.clear_started_at(svc);
                     effects.push(SideEffect::LogEvent(format!(
                         "{svc}: stopped (exit {exit_code:?})"
                     )));
                     // If desired is Running (e.g. after RestartService), auto-start
                     if state.service(svc).desired == DesiredServiceState::Running {
-                        state.service_mut(svc).state = ServiceState::Starting;
+                        state.set_starting(svc);
                         state.service_mut(svc).retry_count = 0;
                         effects.push(SideEffect::SpawnService(svc));
                         effects.push(SideEffect::StartReadinessCheck(svc));
@@ -142,6 +146,7 @@ pub fn reducer(mut state: AppState, event: Event) -> (AppState, Vec<SideEffect>)
                 ServiceState::Starting | ServiceState::Running => {
                     // Unexpected exit → Crashed
                     state.service_mut(svc).state = ServiceState::Crashed;
+                    state.clear_started_at(svc);
                     state.service_mut(svc).last_error =
                         Some(format!("exited unexpectedly (code {exit_code:?})"));
                     effects.push(SideEffect::StopHealthCheck(svc));
@@ -165,6 +170,7 @@ pub fn reducer(mut state: AppState, event: Event) -> (AppState, Vec<SideEffect>)
                             )));
                         } else {
                             state.service_mut(svc).state = ServiceState::Error;
+                            state.clear_started_at(svc);
                             state.service_mut(svc).last_error =
                                 Some("max retries exceeded".to_string());
                             effects.push(SideEffect::LogEvent(format!(
@@ -186,6 +192,7 @@ pub fn reducer(mut state: AppState, event: Event) -> (AppState, Vec<SideEffect>)
             reason,
         } => {
             state.service_mut(svc).state = ServiceState::Error;
+            state.clear_started_at(svc);
             state.service_mut(svc).last_error = Some(reason.clone());
             effects.push(SideEffect::LogEvent(format!(
                 "{svc}: spawn failed — {reason}"
@@ -209,6 +216,7 @@ pub fn reducer(mut state: AppState, event: Event) -> (AppState, Vec<SideEffect>)
                 if streak >= crate::state::HEALTH_FAIL_THRESHOLD {
                     // Treat as unexpected exit for retry logic
                     state.service_mut(svc).state = ServiceState::Crashed;
+                    state.clear_started_at(svc);
                     state.service_mut(svc).last_error =
                         Some(format!("{streak} consecutive health check failures"));
                     effects.push(SideEffect::StopHealthCheck(svc));
@@ -223,6 +231,7 @@ pub fn reducer(mut state: AppState, event: Event) -> (AppState, Vec<SideEffect>)
                             });
                         } else {
                             state.service_mut(svc).state = ServiceState::Error;
+                            state.clear_started_at(svc);
                             state.service_mut(svc).last_error =
                                 Some("max retries exceeded after health failures".to_string());
                             effects.push(SideEffect::LogEvent(format!(
@@ -237,6 +246,7 @@ pub fn reducer(mut state: AppState, event: Event) -> (AppState, Vec<SideEffect>)
         // ── Port conflict ────────────────────────────────────────────────────
         Event::PortConflictDetected(svc) => {
             state.service_mut(svc).state = ServiceState::Error;
+            state.clear_started_at(svc);
             state.service_mut(svc).last_error = Some("port already in use".to_string());
             effects.push(SideEffect::LogEvent(format!(
                 "{svc}: port conflict detected → Error"
@@ -248,7 +258,7 @@ pub fn reducer(mut state: AppState, event: Event) -> (AppState, Vec<SideEffect>)
             if state.service(svc).state == ServiceState::Crashed
                 && state.service(svc).desired == DesiredServiceState::Running
             {
-                state.service_mut(svc).state = ServiceState::Starting;
+                state.set_starting(svc);
                 effects.push(SideEffect::SpawnService(svc));
                 effects.push(SideEffect::StartReadinessCheck(svc));
                 effects.push(SideEffect::LogEvent(format!("{svc}: auto-retry starting")));
@@ -261,14 +271,18 @@ pub fn reducer(mut state: AppState, event: Event) -> (AppState, Vec<SideEffect>)
             reason,
         } => {
             state.service_mut(svc).state = ServiceState::Error;
+            state.clear_started_at(svc);
             state.service_mut(svc).last_error = Some(reason.clone());
             effects.push(SideEffect::StopHealthCheck(svc));
             effects.push(SideEffect::LogEvent(format!("{svc}: FATAL — {reason}")));
         }
 
         // ── Config reload ────────────────────────────────────────────────────
-        Event::ConfigReloaded => {
-            effects.push(SideEffect::LogEvent("config reloaded".to_string()));
+        Event::ConfigReloaded(new_config) => {
+            state.config = *new_config;
+            effects.push(SideEffect::LogEvent(
+                "config reloaded — restart services to apply changes".to_string(),
+            ));
         }
 
         // ── Tick (drives health check cycle — executor owns the timer) ───────
@@ -283,6 +297,7 @@ pub fn reducer(mut state: AppState, event: Event) -> (AppState, Vec<SideEffect>)
                 match state.service(svc).state {
                     ServiceState::Running | ServiceState::Starting => {
                         state.service_mut(svc).state = ServiceState::Stopping;
+                        state.clear_started_at(svc);
                         state.service_mut(svc).desired = DesiredServiceState::Stopped;
                         effects.push(SideEffect::StopHealthCheck(svc));
                         effects.push(SideEffect::KillService(svc));
@@ -622,5 +637,316 @@ mod tests {
             },
         );
         assert_eq!(new_state.apache.state, ServiceState::Error);
+    }
+
+    // ── ConfigReloaded ────────────────────────────────────────────────────
+
+    #[test]
+    fn config_reloaded_updates_state_config() {
+        let state = make_state();
+        let mut new_config = state.config.clone();
+        new_config.apache.port = 9090;
+        let (new_state, effects) = reducer(state, Event::ConfigReloaded(Box::new(new_config)));
+        assert_eq!(new_state.config.apache.port, 9090);
+        // Must emit a log event confirming reload
+        assert!(effects.iter().any(|e| matches!(e, SideEffect::LogEvent(_))));
+        // Must NOT emit any spawn/kill — config reload is passive
+        assert!(!effects
+            .iter()
+            .any(|e| matches!(e, SideEffect::SpawnService(_) | SideEffect::KillService(_))));
+    }
+
+    // ── RestartService edge cases ─────────────────────────────────────────
+
+    #[test]
+    fn restart_from_stopped_spawns_directly() {
+        // RestartService on a Stopped service should start it directly, not go through Stopping
+        let state = make_state(); // apache starts Stopped
+        let (new_state, effects) = reducer(state, Event::RestartService(Service::Apache));
+        assert_eq!(new_state.apache.state, ServiceState::Starting);
+        assert_eq!(new_state.apache.desired, DesiredServiceState::Running);
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, SideEffect::SpawnService(Service::Apache))));
+    }
+
+    #[test]
+    fn restart_from_stopping_sets_desired_running_for_later_start() {
+        // RestartService on a service already Stopping: just sets desired=Running.
+        // When ProcessExit fires, the reducer will auto-start because desired=Running.
+        let mut state = make_state();
+        set_state(&mut state, Service::Apache, ServiceState::Stopping);
+        state.apache.desired = DesiredServiceState::Stopped;
+        let (new_state, effects) = reducer(state, Event::RestartService(Service::Apache));
+        assert_eq!(new_state.apache.state, ServiceState::Stopping); // unchanged
+        assert_eq!(new_state.apache.desired, DesiredServiceState::Running); // updated
+                                                                            // No kill emitted — already stopping
+        assert!(!effects
+            .iter()
+            .any(|e| matches!(e, SideEffect::KillService(Service::Apache))));
+    }
+
+    #[test]
+    fn stopping_process_exit_with_desired_running_respawns() {
+        // After RestartService: Stopping → ProcessExit → should respawn because desired=Running
+        let mut state = make_state();
+        set_state(&mut state, Service::Apache, ServiceState::Stopping);
+        state.apache.desired = DesiredServiceState::Running;
+        let (new_state, effects) = reducer(
+            state,
+            Event::ProcessExit {
+                service: Service::Apache,
+                exit_code: None,
+            },
+        );
+        // Should restart directly into Starting
+        assert_eq!(new_state.apache.state, ServiceState::Starting);
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, SideEffect::SpawnService(Service::Apache))));
+    }
+
+    // ── StopService edge cases ────────────────────────────────────────────
+
+    #[test]
+    fn stop_from_crashed_transitions_to_stopped() {
+        // StopService on Crashed: no kill needed, just set state to Stopped
+        let mut state = make_state();
+        set_state(&mut state, Service::Apache, ServiceState::Crashed);
+        state.apache.desired = DesiredServiceState::Running;
+        let (new_state, effects) = reducer(state, Event::StopService(Service::Apache));
+        assert_eq!(new_state.apache.state, ServiceState::Stopped);
+        assert_eq!(new_state.apache.desired, DesiredServiceState::Stopped);
+        assert!(!effects
+            .iter()
+            .any(|e| matches!(e, SideEffect::KillService(Service::Apache))));
+    }
+
+    #[test]
+    fn stop_from_error_transitions_to_stopped() {
+        let mut state = make_state();
+        set_state(&mut state, Service::Apache, ServiceState::Error);
+        let (new_state, _) = reducer(state, Event::StopService(Service::Apache));
+        assert_eq!(new_state.apache.state, ServiceState::Stopped);
+        assert_eq!(new_state.apache.desired, DesiredServiceState::Stopped);
+    }
+
+    // ── PortConflictDetected ──────────────────────────────────────────────
+
+    #[test]
+    fn port_conflict_transitions_to_error() {
+        let mut state = make_state();
+        set_state(&mut state, Service::Apache, ServiceState::Starting);
+        let (new_state, effects) = reducer(state, Event::PortConflictDetected(Service::Apache));
+        assert_eq!(new_state.apache.state, ServiceState::Error);
+        assert!(new_state
+            .apache
+            .last_error
+            .as_deref()
+            .unwrap_or("")
+            .contains("port"));
+        assert!(effects.iter().any(|e| matches!(e, SideEffect::LogEvent(_))));
+    }
+
+    // ── Health check exhausted retries ────────────────────────────────────
+
+    #[test]
+    fn health_fail_threshold_with_exhausted_retries_transitions_to_error() {
+        // If health check threshold is breached AND retry_count == MAX_RETRIES,
+        // must transition to Error not Crashed.
+        let mut state = make_state();
+        set_state(&mut state, Service::Apache, ServiceState::Running);
+        state.apache.desired = DesiredServiceState::Running;
+        state.apache.retry_count = MAX_RETRIES; // all retries exhausted
+
+        // Apply HEALTH_FAIL_THRESHOLD failures
+        for _ in 0..crate::state::HEALTH_FAIL_THRESHOLD {
+            let (s, _) = reducer(state.clone(), Event::HealthCheckFail(Service::Apache));
+            state = s;
+        }
+        assert_eq!(
+            state.apache.state,
+            ServiceState::Error,
+            "should reach Error when retries exhausted at health threshold"
+        );
+        assert!(!state.apache.last_error.as_deref().unwrap_or("").is_empty());
+    }
+
+    #[test]
+    fn health_check_pass_resets_streak() {
+        let mut state = make_state();
+        set_state(&mut state, Service::Apache, ServiceState::Running);
+        // Build up 2 failures (below threshold)
+        let (s, _) = reducer(state, Event::HealthCheckFail(Service::Apache));
+        let (s, _) = reducer(s, Event::HealthCheckFail(Service::Apache));
+        assert_eq!(s.apache.health_fail_streak, 2);
+        // Pass resets to 0
+        let (s, _) = reducer(s, Event::HealthCheckPass(Service::Apache));
+        assert_eq!(s.apache.health_fail_streak, 0);
+        assert_eq!(s.apache.state, ServiceState::Running);
+    }
+
+    #[test]
+    fn health_check_ignored_when_not_running() {
+        // HealthCheckFail outside Running state must not change state
+        for initial in [
+            ServiceState::Starting,
+            ServiceState::Stopped,
+            ServiceState::Stopping,
+            ServiceState::Crashed,
+            ServiceState::Error,
+        ] {
+            let mut state = make_state();
+            set_state(&mut state, Service::Apache, initial);
+            let (new_state, effects) = reducer(state, Event::HealthCheckFail(Service::Apache));
+            assert_eq!(
+                new_state.apache.state, initial,
+                "HealthCheckFail in {initial} should not change state"
+            );
+            // No kill or retry emitted
+            assert!(!effects.iter().any(|e| matches!(
+                e,
+                SideEffect::KillService(_) | SideEffect::ScheduleRetry { .. }
+            )));
+        }
+    }
+
+    // ── ProcessExit edge cases ────────────────────────────────────────────
+
+    #[test]
+    fn process_exit_in_stopped_state_is_ignored() {
+        // ProcessExit arriving when service is already Stopped must be a no-op
+        let state = make_state(); // starts Stopped
+        let (new_state, effects) = reducer(
+            state,
+            Event::ProcessExit {
+                service: Service::Apache,
+                exit_code: Some(0),
+            },
+        );
+        assert_eq!(new_state.apache.state, ServiceState::Stopped);
+        assert!(!effects.iter().any(|e| matches!(
+            e,
+            SideEffect::SpawnService(_) | SideEffect::ScheduleRetry { .. }
+        )));
+    }
+
+    #[test]
+    fn process_exit_kill_code_none_from_running_still_crashes() {
+        // exit_code=None means killed (by us), but if state=Running it means
+        // something killed it unexpectedly — should still crash + retry.
+        let mut state = make_state();
+        set_state(&mut state, Service::Apache, ServiceState::Running);
+        state.apache.desired = DesiredServiceState::Running;
+        let (new_state, effects) = reducer(
+            state,
+            Event::ProcessExit {
+                service: Service::Apache,
+                exit_code: None,
+            },
+        );
+        assert_eq!(new_state.apache.state, ServiceState::Crashed);
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, SideEffect::ScheduleRetry { .. })));
+    }
+
+    // ── ShutdownAll edge cases ────────────────────────────────────────────
+
+    #[test]
+    fn shutdown_all_with_mixed_states() {
+        // Running services get Stopping+Kill; others get desired=Stopped only
+        let mut state = make_state();
+        set_state(&mut state, Service::Apache, ServiceState::Running);
+        set_state(&mut state, Service::Mysql, ServiceState::Stopped);
+        set_state(&mut state, Service::Php, ServiceState::Crashed);
+        let (new_state, effects) = reducer(state, Event::ShutdownAll);
+
+        assert_eq!(new_state.apache.state, ServiceState::Stopping);
+        assert_eq!(new_state.mysql.state, ServiceState::Stopped);
+        assert_eq!(new_state.php.state, ServiceState::Crashed);
+
+        // All desired set to Stopped
+        assert_eq!(new_state.apache.desired, DesiredServiceState::Stopped);
+        assert_eq!(new_state.mysql.desired, DesiredServiceState::Stopped);
+        assert_eq!(new_state.php.desired, DesiredServiceState::Stopped);
+
+        // Only Running service gets KillService
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, SideEffect::KillService(Service::Apache))));
+        assert!(!effects
+            .iter()
+            .any(|e| matches!(e, SideEffect::KillService(Service::Mysql))));
+    }
+
+    // ── started_at invariant ──────────────────────────────────────────────
+
+    #[test]
+    fn started_at_set_on_starting_cleared_on_running() {
+        let state = make_state();
+        let (state, _) = reducer(state, Event::StartService(Service::Apache));
+        assert!(
+            state.apache.started_at.is_some(),
+            "started_at must be set when Starting"
+        );
+        let (state, _) = reducer(state, Event::ProcessReady(Service::Apache));
+        assert!(
+            state.apache.started_at.is_none(),
+            "started_at must be cleared when Running"
+        );
+    }
+
+    #[test]
+    fn started_at_cleared_on_stopping() {
+        let mut state = make_state();
+        state.set_starting(Service::Apache);
+        assert!(state.apache.started_at.is_some());
+        let (new_state, _) = reducer(state, Event::StopService(Service::Apache));
+        assert!(
+            new_state.apache.started_at.is_none(),
+            "started_at must be cleared when Stopping"
+        );
+    }
+
+    // ── retry_delay boundary ──────────────────────────────────────────────
+
+    #[test]
+    fn retry_delay_returns_correct_values() {
+        use crate::state::retry_delay;
+        use std::time::Duration;
+        assert_eq!(retry_delay(0), Some(Duration::from_secs(1)));
+        assert_eq!(retry_delay(1), Some(Duration::from_secs(2)));
+        assert_eq!(retry_delay(2), Some(Duration::from_secs(4)));
+        assert_eq!(retry_delay(3), Some(Duration::from_secs(8)));
+        // At MAX_RETRIES (4) and beyond — no more retries
+        assert_eq!(retry_delay(4), None);
+        assert_eq!(retry_delay(100), None);
+    }
+
+    // ── AutoRetry ignored when not Crashed ───────────────────────────────
+
+    #[test]
+    fn auto_retry_ignored_when_not_crashed() {
+        // AutoRetry must be a no-op if state is not Crashed (stale timer event)
+        for initial in [
+            ServiceState::Stopped,
+            ServiceState::Starting,
+            ServiceState::Running,
+            ServiceState::Stopping,
+            ServiceState::Error,
+        ] {
+            let mut state = make_state();
+            set_state(&mut state, Service::Apache, initial);
+            state.apache.desired = DesiredServiceState::Running;
+            let (new_state, effects) = reducer(state, Event::AutoRetry(Service::Apache));
+            assert_eq!(
+                new_state.apache.state, initial,
+                "AutoRetry in {initial} should be ignored"
+            );
+            assert!(!effects
+                .iter()
+                .any(|e| matches!(e, SideEffect::SpawnService(_))));
+        }
     }
 }

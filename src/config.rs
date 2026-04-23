@@ -1,4 +1,4 @@
-use crate::paths::InstallPaths;
+use crate::paths::{validate_critical_path, InstallPaths};
 use crate::state::{ApacheConfig, MysqlConfig, PhpConfig, RampConfig};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -38,6 +38,12 @@ impl Default for TomlPhp {
 /// Load and validate ramp.toml from install_dir.
 pub fn load_config(install_dir: &Path) -> Result<RampConfig, String> {
     let paths = InstallPaths::from_install_dir(install_dir)?;
+
+    // Reject ramp.toml if it is a symlink — it could redirect config reads/writes
+    // to a system file, enabling privilege escalation or config escapes.
+    validate_critical_path(&paths.config, install_dir, false)
+        .map_err(|e| format!("ramp.toml path rejected: {e}"))?;
+
     let raw = std::fs::read_to_string(&paths.config)
         .map_err(|e| format!("cannot read ramp.toml: {e}"))?;
     let doc: TomlRoot = toml::from_str(&raw).map_err(|e| format!("ramp.toml parse error: {e}"))?;
@@ -54,7 +60,7 @@ pub fn write_default_config(install_dir: &Path) -> Result<(), String> {
         r#"install_dir = "{}"
 
 [apache]
-port = 80
+port = 8080
 
 [mysql]
 port = 3306
@@ -70,15 +76,20 @@ port = 9000
 fn validate_and_build(doc: TomlRoot, install_dir: &Path) -> Result<RampConfig, String> {
     let paths = InstallPaths::from_install_dir(install_dir)?;
 
-    if doc.apache.port == 0 {
-        return Err(format!("invalid apache.port: {}", doc.apache.port));
+    // Ports must be unprivileged (>= 1024) and non-zero.
+    // Privileged ports require admin rights on Windows and would cause silent
+    // startup failures; port 0 is invalid for any bound service.
+    fn validate_port(name: &str, port: u16) -> Result<(), String> {
+        if port < 1024 {
+            return Err(format!(
+                "invalid {name}.port {port}: must be >= 1024 (privileged ports are not allowed)"
+            ));
+        }
+        Ok(())
     }
-    if doc.mysql.port == 0 {
-        return Err(format!("invalid mysql.port: {}", doc.mysql.port));
-    }
-    if doc.php.port == 0 {
-        return Err(format!("invalid php.port: {}", doc.php.port));
-    }
+    validate_port("apache", doc.apache.port)?;
+    validate_port("mysql", doc.mysql.port)?;
+    validate_port("php", doc.php.port)?;
     if doc.apache.port == doc.mysql.port {
         return Err("apache.port and mysql.port must be different".into());
     }
@@ -191,14 +202,39 @@ port = 3306
             &format!(
                 r#"install_dir = "{}"
 [apache]
-port = 80
+port = 8080
 [mysql]
-port = 80
+port = 8080
 "#,
                 dir.display().to_string().replace('\\', "\\\\")
             ),
         );
         assert!(load_config(dir).is_err());
+    }
+
+    #[test]
+    fn rejects_privileged_port() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        write_toml(
+            dir,
+            &format!(
+                r#"install_dir = "{}"
+[apache]
+port = 80
+[mysql]
+port = 3306
+[php]
+port = 9000
+"#,
+                dir.display().to_string().replace('\\', "\\\\")
+            ),
+        );
+        let err = load_config(dir).unwrap_err();
+        assert!(
+            err.contains("1024"),
+            "expected port>=1024 message, got: {err}"
+        );
     }
 
     #[test]
@@ -242,5 +278,98 @@ port = 9000
         std::fs::write(dir.join("ramp.toml"), b"original").unwrap();
         write_default_config(dir).unwrap();
         assert_eq!(std::fs::read(dir.join("ramp.toml")).unwrap(), b"original");
+    }
+
+    #[test]
+    fn rejects_malformed_toml() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("ramp.toml"), b"[not valid toml @@@").unwrap();
+        let err = load_config(dir).unwrap_err();
+        assert!(
+            err.contains("parse error") || err.contains("TOML") || err.contains("toml"),
+            "expected parse error message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_missing_ramp_toml() {
+        let tmp = TempDir::new().unwrap();
+        let err = load_config(tmp.path()).unwrap_err();
+        assert!(
+            err.contains("cannot read") || err.contains("ramp.toml"),
+            "expected missing file message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_mysql_php_port_clash() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        write_toml(
+            dir,
+            &format!(
+                r#"install_dir = "{}"
+[apache]
+port = 8080
+[mysql]
+port = 9000
+[php]
+port = 9000
+"#,
+                dir.display().to_string().replace('\\', "\\\\")
+            ),
+        );
+        let err = load_config(dir).unwrap_err();
+        assert!(
+            err.contains("mysql") && err.contains("php"),
+            "expected mysql/php clash message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_privileged_port_mysql() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        write_toml(
+            dir,
+            &format!(
+                r#"install_dir = "{}"
+[apache]
+port = 8080
+[mysql]
+port = 1023
+[php]
+port = 9000
+"#,
+                dir.display().to_string().replace('\\', "\\\\")
+            ),
+        );
+        let err = load_config(dir).unwrap_err();
+        assert!(
+            err.contains("1024"),
+            "expected port>=1024 message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn atomic_write_no_tmp_left_on_success() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("out.toml");
+        atomic_write(&path, b"data").unwrap();
+        assert!(path.exists());
+        assert!(!path.with_extension("tmp").exists());
+    }
+
+    #[test]
+    fn write_default_config_creates_parseable_toml() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        write_default_config(dir).unwrap();
+        // The generated default must be loadable — no syntax errors
+        let cfg = load_config(dir).unwrap();
+        assert!(cfg.apache.port >= 1024);
+        assert!(cfg.mysql.port >= 1024);
+        assert!(cfg.php.port >= 1024);
     }
 }

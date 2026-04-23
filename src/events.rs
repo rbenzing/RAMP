@@ -14,7 +14,7 @@ pub enum Event {
     // OS / process signals
     ProcessExit {
         service: Service,
-        exit_code: Option<i32>,
+        exit_code: Option<u32>,
     },
     ProcessReady(Service),
     ProcessSpawnFailed {
@@ -29,8 +29,8 @@ pub enum Event {
     // Port management
     PortConflictDetected(Service),
 
-    // Config
-    ConfigReloaded,
+    // Config — boxed to keep the enum variant size uniform
+    ConfigReloaded(Box<crate::state::RampConfig>),
 
     // Internal
     FatalError {

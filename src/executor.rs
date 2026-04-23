@@ -11,8 +11,14 @@ use std::collections::HashMap;
 struct ServiceHandles {
     /// Channel to signal the watcher thread to force-kill the process.
     kill_tx: crossbeam_channel::Sender<()>,
+    /// Join handle for the watcher thread — used during graceful shutdown to
+    /// block until the process is confirmed dead before RAMP exits.
+    watcher_join: Option<std::thread::JoinHandle<()>>,
     /// Channel to stop the health checker.
     health_stop_tx: Option<crossbeam_channel::Sender<()>>,
+    /// Join handle for the health checker thread — joined during shutdown to
+    /// bound its lifetime and prevent sends to a dead event channel.
+    health_join: Option<std::thread::JoinHandle<()>>,
 }
 
 /// Executor translates SideEffects into real I/O. Owns all live process/thread handles.
@@ -61,12 +67,15 @@ impl Executor {
             let (kill_tx, _) = crossbeam_channel::bounded(1);
             ServiceHandles {
                 kill_tx,
+                watcher_join: None,
                 health_stop_tx: None,
+                health_join: None,
             }
         });
         entry.health_stop_tx = Some(stop_tx);
         let tx = self.tx.clone();
-        std::thread::spawn(move || run_health_checker(svc, port, tx, stop_rx));
+        let join = std::thread::spawn(move || run_health_checker(svc, port, tx, stop_rx));
+        entry.health_join = Some(join);
     }
 
     fn do_spawn(&mut self, svc: Service) {
@@ -85,15 +94,17 @@ impl Executor {
 
         match spawn_service(svc, &self.config, self.tx.clone()) {
             Ok(proc) => {
+                let tx = self.tx.clone();
+                let join = std::thread::spawn(move || watcher(proc, tx, kill_rx));
                 self.handles.insert(
                     svc,
                     ServiceHandles {
                         kill_tx,
+                        watcher_join: Some(join),
                         health_stop_tx: None,
+                        health_join: None,
                     },
                 );
-                let tx = self.tx.clone();
-                std::thread::spawn(move || watcher(proc, tx, kill_rx));
             }
             Err(reason) => {
                 let _ = self.tx.send(Event::ProcessSpawnFailed {
@@ -107,8 +118,15 @@ impl Executor {
     fn do_kill(&mut self, svc: Service) {
         self.do_stop_health(svc);
         if let Some(h) = self.handles.remove(&svc) {
-            // Signal watcher thread to kill the process
+            // Signal watcher to kill its process tree.
             let _ = h.kill_tx.send(());
+            // Join the watcher so we know the kill completed before we return.
+            // This prevents a stale ProcessExit event arriving after a restart
+            // has already moved the service back to Starting, which would cause
+            // the reducer to incorrectly transition Starting → Crashed.
+            if let Some(join) = h.watcher_join {
+                let _ = join.join();
+            }
         }
     }
 
@@ -122,6 +140,12 @@ impl Executor {
         if let Some(h) = self.handles.get_mut(&svc) {
             if let Some(stop) = h.health_stop_tx.take() {
                 let _ = stop.send(());
+            }
+            // Join the health checker thread to bound its lifetime.
+            // The thread exits promptly after receiving the stop signal
+            // (run_health_checker uses select! so it reacts immediately).
+            if let Some(join) = h.health_join.take() {
+                let _ = join.join();
             }
         }
     }
@@ -141,13 +165,49 @@ impl Executor {
             php_desired: state.php.desired,
         };
         let path = self.config.install_dir.join("ramp.state");
-        match serde_json::to_vec_pretty(&persisted) {
-            Ok(data) => {
-                if let Err(e) = atomic_write(&path, &data) {
-                    log::warn!("persist state failed: {e}");
-                }
+        let result = serde_json::to_vec_pretty(&persisted)
+            .map_err(|e| format!("serialize state failed: {e}"))
+            .and_then(|data| atomic_write(&path, &data));
+
+        if let Err(e) = result {
+            // State persistence failure means desired state will be lost on restart.
+            // Log at error level and surface in the UI log buffer directly.
+            log::error!("PERSIST FAILED — desired service state will not survive restart: {e}");
+            let msg =
+                format!("ERROR: state persist failed — restart may not restore services: {e}");
+            self.log.push(msg);
+        }
+    }
+
+    /// Graceful shutdown: signal all watcher threads to kill their processes, stop all
+    /// health checkers, then join every watcher thread — blocking until each managed
+    /// process is confirmed dead. Called by the event loop after processing ShutdownAll.
+    ///
+    /// This guarantees no orphaned processes remain when RAMP exits. The caller should
+    /// enforce an external timeout (SHUTDOWN_GRACE_PERIOD) as a safety net.
+    pub fn shutdown_and_join(&mut self) {
+        // Signal every health checker to stop first so it doesn't send events
+        // to a dying event loop.
+        for h in self.handles.values_mut() {
+            if let Some(stop) = h.health_stop_tx.take() {
+                let _ = stop.send(());
             }
-            Err(e) => log::warn!("serialize state failed: {e}"),
+        }
+
+        // Signal every watcher to kill its process, then collect all join handles.
+        let handles: Vec<_> = self.handles.drain().collect();
+        for (_svc, h) in handles {
+            let _ = h.kill_tx.send(());
+            if let Some(join) = h.watcher_join {
+                // Blocks until proc.kill() + WaitForSingleObject complete.
+                // In practice this is sub-millisecond — the Job Object close is instant.
+                let _ = join.join();
+            }
+            // Health checker threads were already stopped above, but join any that
+            // weren't stopped yet (e.g. if shutdown_and_join is called directly).
+            if let Some(join) = h.health_join {
+                let _ = join.join();
+            }
         }
     }
 
@@ -161,45 +221,32 @@ impl Executor {
 }
 
 /// Watches a running process. Kills it if a kill signal arrives, or emits ProcessExit naturally.
-fn watcher(mut proc: ServiceProcess, tx: Sender<Event>, kill_rx: crossbeam_channel::Receiver<()>) {
+///
+/// Uses crossbeam select! so kill signals are acted on immediately rather than
+/// waiting for the next 100ms poll interval.
+fn watcher(proc: ServiceProcess, tx: Sender<Event>, kill_rx: crossbeam_channel::Receiver<()>) {
     let svc = proc.service;
+    let poll_interval = std::time::Duration::from_millis(100);
 
-    // Poll the child with try_wait so we can also check for kill signals.
     loop {
-        // Check if kill was requested
-        if kill_rx.try_recv().is_ok() {
-            proc.kill();
-            // ProcessExit will be emitted naturally after kill via the process exit path,
-            // but since we consumed the child in kill(), emit it explicitly.
-            let _ = tx.send(Event::ProcessExit {
-                service: svc,
-                exit_code: None,
-            });
-            return;
-        }
-
-        // Non-blocking wait on child
-        match proc.child.try_wait() {
-            Ok(Some(status)) => {
-                let code = status.code();
-                drop(proc.job_handle);
-                let _ = tx.send(Event::ProcessExit {
-                    service: svc,
-                    exit_code: code,
-                });
+        crossbeam_channel::select! {
+            recv(kill_rx) -> _ => {
+                // Kill requested: close Job Object → terminates entire process tree,
+                // then WaitForSingleObject blocks until the main process is gone.
+                proc.kill();
+                let _ = tx.send(Event::ProcessExit { service: svc, exit_code: None });
                 return;
             }
-            Ok(None) => {
-                // Still running — sleep briefly and loop
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            Err(e) => {
-                log::warn!("{svc}: try_wait error: {e}");
-                let _ = tx.send(Event::ProcessExit {
-                    service: svc,
-                    exit_code: None,
-                });
-                return;
+            default(poll_interval) => {
+                // Non-blocking poll: has the process exited on its own?
+                if let Some(code) = proc.try_wait() {
+                    drop(proc);
+                    let _ = tx.send(Event::ProcessExit {
+                        service: svc,
+                        exit_code: Some(code),
+                    });
+                    return;
+                }
             }
         }
     }

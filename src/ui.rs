@@ -1,6 +1,7 @@
+use crate::config::load_config;
 use crate::events::Event;
 use crate::logger::SharedLog;
-use crate::state::{AppState, Service, ServiceState};
+use crate::state::{AppState, Service, ServiceState, HEALTH_FAIL_THRESHOLD};
 use crossbeam_channel::Sender;
 use eframe::egui;
 use std::sync::{Arc, Mutex};
@@ -38,7 +39,15 @@ impl eframe::App for RampApp {
 
         ctx.request_repaint_after(std::time::Duration::from_secs(1));
 
-        let state = self.state.lock().unwrap().clone();
+        let state = match self.state.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => {
+                // Event loop panicked while holding the lock — recover last known state
+                // so the UI keeps rendering rather than crashing.
+                log::error!("state mutex poisoned — event loop may have crashed");
+                poisoned.into_inner().clone()
+            }
+        };
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("RAMP");
@@ -60,6 +69,17 @@ impl eframe::App for RampApp {
                     let _ = self.tx.send(Event::StopService(Service::Apache));
                     let _ = self.tx.send(Event::StopService(Service::Mysql));
                     let _ = self.tx.send(Event::StopService(Service::Php));
+                }
+                if ui.button("Reload Config").clicked() {
+                    match load_config(&state.config.install_dir) {
+                        Ok(new_config) => {
+                            let _ = self.tx.send(Event::ConfigReloaded(Box::new(new_config)));
+                        }
+                        Err(e) => {
+                            log::error!("config reload failed: {e}");
+                            self.log.push(format!("ERROR: config reload failed — {e}"));
+                        }
+                    }
                 }
             });
 
@@ -90,12 +110,36 @@ fn service_row(
     status: &crate::state::ServiceStatus,
 ) {
     ui.horizontal(|ui| {
-        let (dot_color, _label) = state_indicator(status.state);
+        let dot_color = state_indicator(status.state);
         ui.colored_label(dot_color, "●");
         ui.label(format!("{svc}"));
         ui.label(format!("[{}]", status.state));
 
-        if let Some(err) = &status.last_error {
+        // Show elapsed startup time
+        if status.state == ServiceState::Starting {
+            if let Some(start) = status.started_at {
+                ui.label(format!("({}s)", start.elapsed().as_secs()));
+            }
+        }
+
+        // Show health degradation before the service crashes
+        if status.state == ServiceState::Running && status.health_fail_streak > 0 {
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                format!(
+                    "⚠ health {}/{}",
+                    status.health_fail_streak, HEALTH_FAIL_THRESHOLD
+                ),
+            );
+        }
+
+        // Show last error and recovery hint
+        if status.state == ServiceState::Error {
+            if let Some(err) = &status.last_error {
+                ui.colored_label(egui::Color32::RED, format!("⚠ {err}"));
+            }
+            ui.colored_label(egui::Color32::GRAY, "(click Start to retry)");
+        } else if let Some(err) = &status.last_error {
             ui.colored_label(egui::Color32::RED, format!("⚠ {err}"));
         }
 
@@ -113,11 +157,11 @@ fn service_row(
     });
 }
 
-fn state_indicator(state: ServiceState) -> (egui::Color32, &'static str) {
+fn state_indicator(state: ServiceState) -> egui::Color32 {
     match state {
-        ServiceState::Running => (egui::Color32::GREEN, "Running"),
-        ServiceState::Starting | ServiceState::Stopping => (egui::Color32::YELLOW, "…"),
-        ServiceState::Crashed | ServiceState::Error => (egui::Color32::RED, "!"),
-        ServiceState::Stopped => (egui::Color32::GRAY, "Stopped"),
+        ServiceState::Running => egui::Color32::GREEN,
+        ServiceState::Starting | ServiceState::Stopping => egui::Color32::YELLOW,
+        ServiceState::Crashed | ServiceState::Error => egui::Color32::RED,
+        ServiceState::Stopped => egui::Color32::GRAY,
     }
 }

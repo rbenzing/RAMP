@@ -20,6 +20,7 @@ use logger::SharedLog;
 use reducer::reducer;
 use state::{
     AppState, DesiredServiceState, PersistedState, Service, ServiceState, COMMAND_DEBOUNCE,
+    SHUTDOWN_GRACE_PERIOD,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -103,8 +104,13 @@ fn main() {
     let tick_tx = tx.clone();
     std::thread::spawn(move || loop {
         std::thread::sleep(state::HEALTH_CHECK_INTERVAL);
-        if tick_tx.send(Event::Tick).is_err() {
-            break;
+        match tick_tx.send(Event::Tick) {
+            Ok(()) => {}
+            Err(_) => {
+                // Receiver dropped — event loop has shut down; exit the tick thread.
+                log::debug!("tick thread: event channel closed, exiting");
+                break;
+            }
         }
     });
 
@@ -117,6 +123,10 @@ fn main() {
     // System tray thread
     let tray_tx = tx.clone();
     std::thread::spawn(move || tray::run_tray(tray_tx, show_tx));
+
+    // Shutdown coordination: event loop signals this when all processes are dead.
+    // main() waits on it after run_native returns, guaranteeing clean process teardown.
+    let (shutdown_done_tx, shutdown_done_rx) = crossbeam_channel::bounded::<()>(1);
 
     // Event loop thread
     let config_for_executor = config.clone();
@@ -147,6 +157,8 @@ fn main() {
                 last_cmd.insert(key, now);
             }
 
+            let is_shutdown = matches!(event, Event::ShutdownAll);
+
             let apache_was = state.apache.state;
             let mysql_was = state.mysql.state;
             let php_was = state.php.state;
@@ -167,8 +179,26 @@ fn main() {
 
             executor.execute(effects, &state);
 
-            if let Ok(mut s) = shared_state_writer.lock() {
-                *s = state.clone();
+            // Recover from a poisoned mutex (e.g. UI thread panicked while holding
+            // the lock). The data is still valid — overwrite it with current state.
+            let mut s = match shared_state_writer.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    log::error!("state mutex poisoned — recovering (UI thread may have crashed)");
+                    poisoned.into_inner()
+                }
+            };
+            *s = state.clone();
+
+            if is_shutdown {
+                // Block here until every managed process is confirmed dead.
+                // Watcher threads call WaitForSingleObject so this returns as soon
+                // as the OS has terminated all process trees — typically < 1ms.
+                log::info!("shutdown: waiting for all processes to terminate");
+                executor.shutdown_and_join();
+                log::info!("shutdown: all processes stopped");
+                let _ = shutdown_done_tx.send(());
+                break;
             }
         }
     });
@@ -194,6 +224,17 @@ fn main() {
         eprintln!("GUI error: {e}");
         std::process::exit(1);
     });
+
+    // eframe has returned — on_exit already sent ShutdownAll.
+    // Wait for the event loop to confirm all processes are dead before we exit.
+    // The timeout is a safety net; in practice shutdown completes in milliseconds.
+    log::info!("waiting for clean shutdown (grace period: {SHUTDOWN_GRACE_PERIOD:?})");
+    match shutdown_done_rx.recv_timeout(SHUTDOWN_GRACE_PERIOD) {
+        Ok(()) => log::info!("clean shutdown complete"),
+        Err(_) => log::warn!(
+            "shutdown timed out after {SHUTDOWN_GRACE_PERIOD:?} — processes may still be running"
+        ),
+    }
 }
 
 /// Create all runtime directories that must exist before services start.

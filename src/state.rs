@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServiceState {
@@ -61,6 +61,15 @@ pub struct ServiceStatus {
     pub retry_count: u32,
     pub last_error: Option<String>,
     pub health_fail_streak: u32,
+    /// Set when the service transitions to Starting; cleared on Running/Stopped/Error/Crashed.
+    /// Used by the UI to display elapsed startup time. Not persisted.
+    pub started_at: Option<Instant>,
+}
+
+impl Default for ServiceStatus {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ServiceStatus {
@@ -71,6 +80,7 @@ impl ServiceStatus {
             retry_count: 0,
             last_error: None,
             health_fail_streak: 0,
+            started_at: None,
         }
     }
 }
@@ -110,6 +120,12 @@ pub struct PortState {
     pub apache_bound: bool,
     pub mysql_bound: bool,
     pub php_bound: bool,
+}
+
+impl Default for PortState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PortState {
@@ -159,6 +175,19 @@ impl AppState {
             Service::Mysql => &mut self.mysql,
             Service::Php => &mut self.php,
         }
+    }
+
+    /// Transition a service to Starting and record when it began.
+    /// Use this instead of setting state directly to keep started_at consistent.
+    pub fn set_starting(&mut self, svc: Service) {
+        let s = self.service_mut(svc);
+        s.state = ServiceState::Starting;
+        s.started_at = Some(Instant::now());
+    }
+
+    /// Clear started_at when a service leaves the Starting state.
+    pub fn clear_started_at(&mut self, svc: Service) {
+        self.service_mut(svc).started_at = None;
     }
 }
 

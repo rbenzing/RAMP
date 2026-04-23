@@ -38,6 +38,12 @@ impl RingBuffer {
 #[derive(Clone)]
 pub struct SharedLog(Arc<Mutex<RingBuffer>>);
 
+impl Default for SharedLog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SharedLog {
     pub fn new() -> Self {
         Self(Arc::new(Mutex::new(RingBuffer::new(DEFAULT_MAX_LINES))))
@@ -81,5 +87,35 @@ mod tests {
         }
         let t = buf.tail(3);
         assert_eq!(t, vec!["7", "8", "9"]);
+    }
+
+    #[test]
+    fn tail_zero_returns_empty() {
+        let mut buf = RingBuffer::new(10);
+        buf.push("a".into());
+        assert!(buf.tail(0).is_empty());
+    }
+
+    #[test]
+    fn tail_more_than_buffer_returns_all() {
+        let mut buf = RingBuffer::new(5);
+        buf.push("a".into());
+        buf.push("b".into());
+        assert_eq!(buf.tail(1000), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn shared_log_push_and_tail() {
+        let log = SharedLog::new();
+        log.push("first".into());
+        log.push("second".into());
+        let t = log.tail(10);
+        assert_eq!(t, vec!["first", "second"]);
+    }
+
+    #[test]
+    fn shared_log_tail_on_empty_returns_empty() {
+        let log = SharedLog::new();
+        assert!(log.tail(10).is_empty());
     }
 }
