@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod apache_conf;
 mod config;
 mod events;
@@ -25,6 +27,8 @@ use state::{
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use windows::core::PCWSTR;
+use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -58,24 +62,31 @@ fn main() {
 
     // 2. Generate httpd.conf if missing
     if let Err(e) = apache_conf::ensure_httpd_conf(&config) {
-        fatal(&format!("cannot generate httpd.conf: {e}"));
+        log::warn!("cannot generate httpd.conf: {e}");
     }
     if let Err(e) = apache_conf::ensure_htdocs(&config) {
-        fatal(&format!("cannot create htdocs: {e}"));
+        log::warn!("cannot create htdocs: {e}");
     }
 
     // 3. Generate my.ini if missing
     if let Err(e) = mysql_conf::ensure_my_ini(&config) {
-        fatal(&format!("cannot generate my.ini: {e}"));
+        log::warn!("cannot generate my.ini: {e}");
     }
 
-    // 4. Initialize MySQL data directory on first run (blocking)
-    if mysql_conf::needs_initialization(&config) {
+    // 4. MySQL data directory initialization — deferred: if mysqld binary is missing
+    //    we record the error and let the UI surface it rather than crashing silently.
+    let mysql_init_error: Option<String> = if mysql_conf::needs_initialization(&config) {
         log::info!("MySQL data directory is empty — running --initialize-insecure");
-        if let Err(e) = mysql_conf::initialize_mysql(&config) {
-            fatal(&format!("MySQL initialization failed: {e}"));
+        match mysql_conf::initialize_mysql(&config) {
+            Ok(()) => None,
+            Err(e) => {
+                log::error!("MySQL initialization failed: {e}");
+                Some(e)
+            }
         }
-    }
+    } else {
+        None
+    };
 
     // 5. Generate php.ini if missing (PHP-CGI is optional — missing binary is not fatal)
     if let Err(e) = php_conf::ensure_php_dirs(&config) {
@@ -93,6 +104,13 @@ fn main() {
     app_state.apache.desired = persisted.apache_desired;
     app_state.mysql.desired = persisted.mysql_desired;
     app_state.php.desired = persisted.php_desired;
+
+    // Surface deferred provisioning errors into the UI
+    if let Some(e) = mysql_init_error {
+        app_state.mysql.state = ServiceState::Error;
+        app_state.mysql.last_error = Some(format!("Init failed: {e}"));
+        app_state.mysql.desired = DesiredServiceState::Stopped;
+    }
 
     let shared_state = Arc::new(Mutex::new(app_state.clone()));
     let shared_state_writer = shared_state.clone();
@@ -208,7 +226,8 @@ fn main() {
         viewport: egui::ViewportBuilder::default()
             .with_title("RAMP")
             .with_inner_size([520.0, 480.0])
-            .with_min_inner_size([400.0, 300.0]),
+            .with_min_inner_size([400.0, 300.0])
+            .with_visible(true),
         ..Default::default()
     };
 
@@ -271,9 +290,20 @@ fn debounce_key(event: &Event) -> Option<String> {
     }
 }
 
-/// Print a fatal error and exit. Never returns.
+/// Show a modal error dialog and exit. Never returns.
+/// Safe to call before the egui window exists and with windows_subsystem = "windows".
 fn fatal(msg: &str) -> ! {
-    eprintln!("FATAL: {msg}");
     log::error!("{msg}");
+    let title: Vec<u16> = "RAMP — Fatal Error\0".encode_utf16().collect();
+    let mut body: Vec<u16> = msg.encode_utf16().collect();
+    body.push(0);
+    unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(body.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_OK | MB_ICONERROR,
+        );
+    }
     std::process::exit(1);
 }

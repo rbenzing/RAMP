@@ -133,14 +133,18 @@ fn service_row(
             );
         }
 
-        // Show last error and recovery hint
+        // Show last error and recovery hint — truncated inline, full text on hover
         if status.state == ServiceState::Error {
             if let Some(err) = &status.last_error {
-                ui.colored_label(egui::Color32::RED, format!("⚠ {err}"));
+                let short = truncate_error(err);
+                ui.colored_label(egui::Color32::RED, format!("⚠ {short}"))
+                    .on_hover_text(err.as_str());
             }
-            ui.colored_label(egui::Color32::GRAY, "(click Start to retry)");
+            ui.colored_label(egui::Color32::GRAY, "(Start to retry)");
         } else if let Some(err) = &status.last_error {
-            ui.colored_label(egui::Color32::RED, format!("⚠ {err}"));
+            let short = truncate_error(err);
+            ui.colored_label(egui::Color32::RED, format!("⚠ {short}"))
+                .on_hover_text(err.as_str());
         }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -155,6 +159,20 @@ fn service_row(
             }
         });
     });
+}
+
+fn truncate_error(msg: &str) -> &str {
+    const MAX: usize = 40;
+    if msg.len() <= MAX {
+        msg
+    } else {
+        // Truncate at a char boundary
+        let mut idx = MAX;
+        while !msg.is_char_boundary(idx) {
+            idx -= 1;
+        }
+        &msg[..idx]
+    }
 }
 
 fn state_indicator(state: ServiceState) -> egui::Color32 {

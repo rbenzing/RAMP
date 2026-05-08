@@ -61,6 +61,28 @@ pub fn initialize_mysql(cfg: &RampConfig) -> Result<(), String> {
     let mysql_logs = cfg.install_dir.join("mysql").join("logs");
     std::fs::create_dir_all(&mysql_logs).map_err(|e| format!("cannot create mysql/logs: {e}"))?;
 
+    // mysqld refuses --initialize-insecure if the data dir is non-empty.
+    // Clear any leftovers from a prior failed init so this run can succeed.
+    let data_dir = &cfg.mysql.data_dir;
+    if data_dir.exists() {
+        let entries = std::fs::read_dir(data_dir)
+            .map_err(|e| format!("cannot read data dir {}: {e}", data_dir.display()))?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let result = if path.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+            if let Err(e) = result {
+                return Err(format!(
+                    "cannot clear stale data dir entry {}: {e}",
+                    path.display()
+                ));
+            }
+        }
+    }
+
     let bin = &cfg.mysql.bin;
     let ini = &cfg.mysql.ini;
     let work_dir = bin

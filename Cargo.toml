@@ -31,7 +31,11 @@ features = [
     "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_System_IO",
+    "Win32_UI_WindowsAndMessaging",
 ]
+
+[build-dependencies]
+winres = "0.1"
 
 [dev-dependencies]
 proptest = "1"

@@ -12,7 +12,11 @@ ServerRoot "{apache_dir}"
 
 Listen 127.0.0.1:{port}
 
+# Note: on Windows, the MPM (mpm_winnt) and unixd are linked statically into
+# httpd.exe — there is no LoadModule line for them.
+
 # Core modules required for basic operation
+LoadModule authn_core_module modules/mod_authn_core.so
 LoadModule authz_core_module modules/mod_authz_core.so
 LoadModule authz_host_module modules/mod_authz_host.so
 LoadModule access_compat_module modules/mod_access_compat.so
@@ -26,7 +30,6 @@ LoadModule deflate_module modules/mod_deflate.so
 LoadModule filter_module modules/mod_filter.so
 LoadModule setenvif_module modules/mod_setenvif.so
 LoadModule version_module modules/mod_version.so
-LoadModule unixd_module modules/mod_unixd.so
 LoadModule autoindex_module modules/mod_autoindex.so
 LoadModule negotiation_module modules/mod_negotiation.so
 LoadModule alias_module modules/mod_alias.so
@@ -38,9 +41,6 @@ LoadModule proxy_fcgi_module modules/mod_proxy_fcgi.so
 
 ServerAdmin local@localhost
 ServerName 127.0.0.1:{port}
-
-# Only bind locally — no external exposure
-BindAddress 127.0.0.1
 
 <Directory />
     AllowOverride none
