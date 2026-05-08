@@ -28,6 +28,12 @@ pub enum Event {
 
     // Port management
     PortConflictDetected(Service),
+    /// Executor resolved the port the service will actually bind to.
+    /// Emitted before a successful spawn so the UI/reducer know the chosen port.
+    PortAssigned {
+        service: Service,
+        port: u16,
+    },
 
     // Config — boxed to keep the enum variant size uniform
     ConfigReloaded(Box<crate::state::RampConfig>),

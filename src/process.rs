@@ -158,6 +158,11 @@ fn build_env_block(vars: &[(String, String)]) -> Vec<u16> {
 
 /// Validate binary, spawn process suspended, attach to Windows Job Object, then resume.
 ///
+/// `effective_port` is the port the service should actually bind to. For PHP this is
+/// passed as a CLI argument; for Apache/MySQL the port is baked into their config
+/// files, which the caller must regenerate before calling this if it differs from
+/// the configured port.
+///
 /// Using CREATE_SUSPENDED closes the race window where grandchildren could be spawned
 /// before Job Object assignment: the process cannot execute any user code until we call
 /// ResumeThread after AssignProcessToJobObject succeeds.
@@ -166,9 +171,10 @@ fn build_env_block(vars: &[(String, String)]) -> Vec<u16> {
 pub fn spawn_service(
     svc: Service,
     cfg: &RampConfig,
+    effective_port: u16,
     _tx: Sender<Event>,
 ) -> Result<ServiceProcess, String> {
-    let (bin, args, work_dir) = service_params(svc, cfg);
+    let (bin, args, work_dir) = service_params(svc, cfg, effective_port);
 
     validate_critical_path(&bin, &cfg.install_dir, false)
         .map_err(|e| format!("binary validation: {e}"))?;
@@ -279,17 +285,44 @@ pub fn spawn_service(
     })
 }
 
-/// Pre-check whether a port is available by attempting a bind.
+/// Pre-check whether a port is available.
+///
+/// Tries to connect to 127.0.0.1:port — if connect succeeds, a real listener owns
+/// the port (conflict). If connect fails with ConnectionRefused, the port has no
+/// listener and is free to bind. We avoid TcpListener::bind here because on Windows
+/// it returns WSAEADDRINUSE for sockets in TIME_WAIT state, producing false positives
+/// after a crash loop even though no live process owns the port.
 pub fn check_port_available(port: u16) -> bool {
-    use std::net::TcpListener;
-    TcpListener::bind(format!("127.0.0.1:{port}")).is_ok()
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::Duration;
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    // Ok(_) = a listener accepted us → port in use
+    // Err(_) = refused, timed out, or no route → no listener, port is free
+    TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_err()
 }
 
-fn service_params(svc: Service, cfg: &RampConfig) -> (PathBuf, Vec<String>, PathBuf) {
+/// Scan upward from `start` for the first free port, up to `start + range` inclusive.
+/// Returns None if every port in the range is occupied.
+pub fn find_available_port(start: u16, range: u16) -> Option<u16> {
+    for offset in 0..=range {
+        let port = start.checked_add(offset)?;
+        if check_port_available(port) {
+            return Some(port);
+        }
+    }
+    None
+}
+
+fn service_params(
+    svc: Service,
+    cfg: &RampConfig,
+    effective_port: u16,
+) -> (PathBuf, Vec<String>, PathBuf) {
     match svc {
         Service::Apache => {
+            // Apache's port is baked into httpd.conf; the caller is responsible for
+            // regenerating that file when effective_port differs from the configured port.
             let bin = cfg.apache.bin.clone();
-            // ServerRoot is the apache\ dir; work_dir must be there so relative log paths resolve
             let work_dir = cfg.install_dir.join("apache");
             let args = vec![
                 "-f".into(),
@@ -299,11 +332,10 @@ fn service_params(svc: Service, cfg: &RampConfig) -> (PathBuf, Vec<String>, Path
             (bin, args, work_dir)
         }
         Service::Mysql => {
+            // MySQL's port is baked into my.ini; the caller is responsible for
+            // regenerating it when effective_port differs from the configured port.
             let bin = cfg.mysql.bin.clone();
             let work_dir = cfg.install_dir.join("mysql");
-            // Use to_string_lossy() for the path component. build_command_line() will
-            // apply proper MSVC quoting around the whole argument, so spaces in the
-            // path are handled safely — no shell is involved.
             let args = vec![
                 format!("--defaults-file={}", cfg.mysql.ini.to_string_lossy()),
                 "--console".into(),
@@ -313,9 +345,8 @@ fn service_params(svc: Service, cfg: &RampConfig) -> (PathBuf, Vec<String>, Path
         Service::Php => {
             let bin = cfg.php.bin.clone();
             let work_dir = cfg.install_dir.join("php");
-            // PHP-CGI in FastCGI mode: bind to loopback on the configured port.
-            // PHP_FCGI_CHILDREN=0 lets Apache control worker count via mod_proxy_fcgi.
-            let args = vec!["-b".into(), format!("127.0.0.1:{}", cfg.php.port)];
+            // PHP-CGI in FastCGI mode: bind to loopback on the resolved port.
+            let args = vec!["-b".into(), format!("127.0.0.1:{effective_port}")];
             (bin, args, work_dir)
         }
     }

@@ -53,9 +53,27 @@ impl eframe::App for RampApp {
             ui.heading("RAMP");
             ui.separator();
 
-            service_row(ui, &self.tx, Service::Apache, &state.apache);
-            service_row(ui, &self.tx, Service::Mysql, &state.mysql);
-            service_row(ui, &self.tx, Service::Php, &state.php);
+            service_row(
+                ui,
+                &self.tx,
+                Service::Apache,
+                &state.apache,
+                state.config.apache.port,
+            );
+            service_row(
+                ui,
+                &self.tx,
+                Service::Mysql,
+                &state.mysql,
+                state.config.mysql.port,
+            );
+            service_row(
+                ui,
+                &self.tx,
+                Service::Php,
+                &state.php,
+                state.config.php.port,
+            );
 
             ui.separator();
 
@@ -108,12 +126,26 @@ fn service_row(
     tx: &Sender<Event>,
     svc: Service,
     status: &crate::state::ServiceStatus,
+    configured_port: u16,
 ) {
     ui.horizontal(|ui| {
         let dot_color = state_indicator(status.state);
         ui.colored_label(dot_color, "●");
         ui.label(format!("{svc}"));
         ui.label(format!("[{}]", status.state));
+
+        // Show effective port — yellow when remapped from the configured value.
+        if let Some(eff) = status.effective_port {
+            if eff == configured_port {
+                ui.label(format!(":{eff}"));
+            } else {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    format!(":{eff} (cfg {configured_port})"),
+                )
+                .on_hover_text("Configured port was in use; bound to next free port");
+            }
+        }
 
         // Show elapsed startup time
         if status.state == ServiceState::Starting {

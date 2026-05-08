@@ -7,6 +7,13 @@ pub fn generate_php_ini(cfg: &RampConfig) -> String {
     let php_dir_s = php_dir.display().to_string().replace('\\', "/");
     let ext_dir = php_dir.join("ext");
     let ext_dir_s = ext_dir.display().to_string().replace('\\', "/");
+    let doc_root = cfg
+        .install_dir
+        .join("apache")
+        .join("htdocs")
+        .display()
+        .to_string()
+        .replace('\\', "/");
 
     format!(
         r#"; RAMP — generated php.ini
@@ -36,8 +43,11 @@ auto_globals_jit = On
 post_max_size = 64M
 default_mimetype = "text/html"
 default_charset = "UTF-8"
-doc_root =
+doc_root = "{doc_root}"
 user_dir =
+cgi.fix_pathinfo = 1
+cgi.force_redirect = 0
+cgi.discard_path = 0
 extension_dir = "{ext_dir}"
 enable_dl = Off
 file_uploads = On
@@ -128,6 +138,7 @@ session.sid_bits_per_character = 5
 "#,
         php_dir = php_dir_s,
         ext_dir = ext_dir_s,
+        doc_root = doc_root,
         mysql_port = cfg.mysql.port,
     )
 }

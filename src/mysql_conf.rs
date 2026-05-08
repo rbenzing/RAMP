@@ -3,9 +3,15 @@ use crate::state::RampConfig;
 /// Generate a minimal my.ini for MySQL 9.x compatible with RAMP's layout.
 /// Only called when the file does not already exist.
 pub fn generate_my_ini(cfg: &RampConfig) -> String {
-    let mysql_dir = cfg.install_dir.join("mysql");
-    let mysql_dir_s = mysql_dir.display().to_string().replace('\\', "/");
-    let data_dir_s = cfg.mysql.data_dir.display().to_string().replace('\\', "/");
+    generate_my_ini_with_port(cfg, cfg.mysql.port)
+}
+
+/// Same as `generate_my_ini` but with an explicit port — used by the executor
+/// when the configured port was occupied and a different one was chosen.
+pub fn generate_my_ini_with_port(cfg: &RampConfig, port: u16) -> String {
+    let mysql_dir_path = cfg.install_dir.join("mysql");
+    let mysql_dir = mysql_dir_path.display().to_string().replace('\\', "/");
+    let data_dir = cfg.mysql.data_dir.display().to_string().replace('\\', "/");
 
     format!(
         r#"# RAMP — generated my.ini
@@ -33,11 +39,19 @@ sql_mode = ""
 [client]
 port        = {port}
 default-character-set = utf8mb4
-"#,
-        mysql_dir = mysql_dir_s,
-        data_dir = data_dir_s,
-        port = cfg.mysql.port,
+"#
     )
+}
+
+/// Force-rewrite my.ini with an explicit port override. Used when the executor
+/// has resolved MySQL to a different port than the configured one.
+pub fn rewrite_my_ini_with_port(cfg: &RampConfig, port: u16) -> Result<(), String> {
+    let ini_path = &cfg.mysql.ini;
+    let dir = ini_path.parent().ok_or("my.ini has no parent dir")?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create mysql dir: {e}"))?;
+    let content = generate_my_ini_with_port(cfg, port);
+    crate::config::atomic_write(ini_path, content.as_bytes())
+        .map_err(|e| format!("cannot rewrite my.ini: {e}"))
 }
 
 /// Write my.ini only if it doesn't already exist.

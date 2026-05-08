@@ -3,6 +3,12 @@ use crate::state::RampConfig;
 /// Generate a minimal httpd.conf for RAMP's bundled Apache layout.
 /// Only called when the file does not already exist (never overwrites user edits).
 pub fn generate_httpd_conf(cfg: &RampConfig) -> String {
+    generate_httpd_conf_with_ports(cfg, cfg.apache.port, cfg.php.port)
+}
+
+/// Same as `generate_httpd_conf` but with explicit port overrides — used by the
+/// executor when the configured port was occupied and a different one was chosen.
+pub fn generate_httpd_conf_with_ports(cfg: &RampConfig, port: u16, php_port: u16) -> String {
     let apache_dir = cfg.install_dir.join("apache");
     let apache_dir = apache_dir.display().to_string().replace('\\', "/");
 
@@ -58,10 +64,20 @@ DocumentRoot "{apache_dir}/htdocs"
     DirectoryIndex index.php index.html index.htm
 </IfModule>
 
-# Proxy .php requests to PHP-CGI FastCGI listener
-<FilesMatch "\.php$">
-    SetHandler "proxy:fcgi://127.0.0.1:{php_port}"
-</FilesMatch>
+# Proxy .php requests to PHP-CGI FastCGI listener.
+#
+# Why this is the way it is:
+# - The naive `<FilesMatch> + SetHandler "proxy:fcgi://..."` pattern breaks on
+#   Windows because mod_proxy_fcgi appends the script's drive-lettered path
+#   directly to the proxy URL ("fcgi://host:9000c:/..."), which the URL parser
+#   sees as a malformed authority → "DNS lookup failure".
+# - ProxyPassMatch with an explicit script-path target avoids the URL parsing
+#   bug. The capture group `$1` holds the relative script path; PHP-CGI then
+#   joins it against `doc_root` from php.ini to find the real file. We rely on
+#   `doc_root` (set in php.ini) rather than absolute paths in the proxy URL,
+#   because absolute Windows paths in fcgi:// URLs trigger the same parser bug.
+ProxyFCGIBackendType GENERIC
+ProxyPassMatch "^/(.+\.php(/.*)?)$" "fcgi://127.0.0.1:{php_port}/$1"
 
 # Deny .htaccess and .htpasswd access
 <Files ".ht*">
@@ -81,11 +97,23 @@ LogLevel warn
     AddType application/x-compress .Z
     AddType application/x-gzip .gz .tgz
 </IfModule>
-"#,
-        apache_dir = apache_dir,
-        port = cfg.apache.port,
-        php_port = cfg.php.port,
+"#
     )
+}
+
+/// Force-rewrite httpd.conf with explicit port overrides. Used when the executor
+/// has resolved Apache or PHP to a different port than the configured one.
+pub fn rewrite_httpd_conf_with_ports(
+    cfg: &RampConfig,
+    port: u16,
+    php_port: u16,
+) -> Result<(), String> {
+    let conf_path = &cfg.apache.conf;
+    let dir = conf_path.parent().ok_or("httpd.conf has no parent dir")?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create apache/conf dir: {e}"))?;
+    let content = generate_httpd_conf_with_ports(cfg, port, php_port);
+    crate::config::atomic_write(conf_path, content.as_bytes())
+        .map_err(|e| format!("cannot rewrite httpd.conf: {e}"))
 }
 
 /// Write httpd.conf only if it doesn't already exist.
@@ -158,7 +186,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cfg = test_cfg(tmp.path());
         let conf = generate_httpd_conf(&cfg);
-        assert!(conf.contains("proxy:fcgi://127.0.0.1:9000"));
+        assert!(conf.contains("fcgi://127.0.0.1:9000"));
+        assert!(conf.contains("ProxyPassMatch"));
         assert!(conf.contains("mod_proxy_fcgi.so"));
     }
 

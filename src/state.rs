@@ -64,6 +64,10 @@ pub struct ServiceStatus {
     /// Set when the service transitions to Starting; cleared on Running/Stopped/Error/Crashed.
     /// Used by the UI to display elapsed startup time. Not persisted.
     pub started_at: Option<Instant>,
+    /// Port the service is actually bound to. May differ from the configured port when
+    /// the configured one was in use and the executor scanned upward for a free one.
+    /// None until the first successful spawn. Not persisted.
+    pub effective_port: Option<u16>,
 }
 
 impl Default for ServiceStatus {
@@ -81,9 +85,14 @@ impl ServiceStatus {
             last_error: None,
             health_fail_streak: 0,
             started_at: None,
+            effective_port: None,
         }
     }
 }
+
+/// Maximum number of ports to scan upward from the configured port when looking
+/// for a free one (e.g. 8080 → 8081 → … → 8100). Beyond this we surrender.
+pub const PORT_SCAN_RANGE: u16 = 20;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApacheConfig {

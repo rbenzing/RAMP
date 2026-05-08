@@ -7,17 +7,27 @@ use std::io::Read;
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
-/// Check if Apache is ready: TCP connect + HTTP 200–399 + Apache signature.
+/// Check if Apache is ready.
+///
+/// Probes a deliberately-nonexistent path so Apache returns 404 from its own error
+/// handler (with the Server header) without invoking the PHP FastCGI proxy. This
+/// avoids hanging the readiness check when PHP-CGI isn't running yet — requesting
+/// "/" would route through `mod_proxy_fcgi` and block for the proxy connect timeout.
+///
+/// Any HTTP response identifying as Apache via the Server header counts as ready.
 pub fn check_apache_ready(port: u16) -> bool {
-    let url = format!("http://127.0.0.1:{port}/");
+    let url = format!("http://127.0.0.1:{port}/__ramp_health");
     match ureq::get(&url).timeout(Duration::from_secs(2)).call() {
-        Ok(resp) => {
-            let status = resp.status();
-            let server = resp.header("Server").unwrap_or("").to_lowercase();
-            (200..400).contains(&status) && server.contains("apache")
-        }
+        Ok(resp) => server_is_apache(resp.header("Server").unwrap_or("")),
+        // 4xx/5xx responses come back as Err::Status with the underlying response —
+        // a 404 from Apache is exactly what we want to see here.
+        Err(ureq::Error::Status(_, resp)) => server_is_apache(resp.header("Server").unwrap_or("")),
         Err(_) => false,
     }
+}
+
+fn server_is_apache(header: &str) -> bool {
+    header.to_lowercase().contains("apache")
 }
 
 /// Check if MySQL is ready: TCP connect + reads MySQL greeting packet prefix.

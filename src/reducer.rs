@@ -144,12 +144,16 @@ pub fn reducer(mut state: AppState, event: Event) -> (AppState, Vec<SideEffect>)
                     }
                 }
                 ServiceState::Starting | ServiceState::Running => {
-                    // Unexpected exit → Crashed
+                    // Unexpected exit → Crashed.
+                    // Note: ProcessExit can also be synthesised by the readiness poller
+                    // when readiness times out — in that case the OS process may still
+                    // be alive. Emit KillService to guarantee cleanup before any retry.
                     state.service_mut(svc).state = ServiceState::Crashed;
                     state.clear_started_at(svc);
                     state.service_mut(svc).last_error =
                         Some(format!("exited unexpectedly (code {exit_code:?})"));
                     effects.push(SideEffect::StopHealthCheck(svc));
+                    effects.push(SideEffect::KillService(svc));
                     effects.push(SideEffect::LogEvent(format!(
                         "{svc}: crashed (exit {exit_code:?})"
                     )));
@@ -247,10 +251,25 @@ pub fn reducer(mut state: AppState, event: Event) -> (AppState, Vec<SideEffect>)
         Event::PortConflictDetected(svc) => {
             state.service_mut(svc).state = ServiceState::Error;
             state.clear_started_at(svc);
-            state.service_mut(svc).last_error = Some("port already in use".to_string());
+            state.service_mut(svc).last_error = Some("no free port within scan range".to_string());
             effects.push(SideEffect::LogEvent(format!(
-                "{svc}: port conflict detected → Error"
+                "{svc}: no free port within scan range → Error"
             )));
+        }
+
+        Event::PortAssigned { service: svc, port } => {
+            state.service_mut(svc).effective_port = Some(port);
+            // Only log when the chosen port differs from the configured one.
+            let configured = match svc {
+                Service::Apache => state.config.apache.port,
+                Service::Mysql => state.config.mysql.port,
+                Service::Php => state.config.php.port,
+            };
+            if port != configured {
+                effects.push(SideEffect::LogEvent(format!(
+                    "{svc}: configured port {configured} in use — using {port} instead"
+                )));
+            }
         }
 
         // ── Auto-retry (from executor timer) ────────────────────────────────

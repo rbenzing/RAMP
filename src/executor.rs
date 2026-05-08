@@ -1,9 +1,11 @@
+use crate::apache_conf::rewrite_httpd_conf_with_ports;
 use crate::config::atomic_write;
 use crate::events::{Event, SideEffect};
 use crate::health::{poll_until_ready, run_health_checker};
 use crate::logger::SharedLog;
-use crate::process::{check_port_available, spawn_service, ServiceProcess};
-use crate::state::{AppState, PersistedState, RampConfig, Service};
+use crate::mysql_conf::rewrite_my_ini_with_port;
+use crate::process::{find_available_port, spawn_service, ServiceProcess};
+use crate::state::{AppState, PersistedState, RampConfig, Service, PORT_SCAN_RANGE};
 use crossbeam_channel::Sender;
 use std::collections::HashMap;
 
@@ -27,6 +29,10 @@ pub struct Executor {
     tx: Sender<Event>,
     log: SharedLog,
     handles: HashMap<Service, ServiceHandles>,
+    /// Effective port per service — set when do_spawn resolves a free port.
+    /// Used by readiness/health checks and by config regen for cross-service ports
+    /// (e.g. Apache's httpd.conf needs PHP's effective port for the FastCGI proxy).
+    effective_ports: HashMap<Service, u16>,
 }
 
 impl Executor {
@@ -36,7 +42,16 @@ impl Executor {
             tx,
             log,
             handles: HashMap::new(),
+            effective_ports: HashMap::new(),
         }
+    }
+
+    /// Effective port to bind/probe — falls back to the configured port until a spawn resolves one.
+    fn effective_port(&self, svc: Service) -> u16 {
+        self.effective_ports
+            .get(&svc)
+            .copied()
+            .unwrap_or_else(|| self.port(svc))
     }
 
     pub fn execute(&mut self, effects: Vec<SideEffect>, state: &AppState) {
@@ -61,7 +76,7 @@ impl Executor {
     /// Start health checks for a service that just became Running.
     pub fn start_health_check(&mut self, svc: Service) {
         self.do_stop_health(svc);
-        let port = self.port(svc);
+        let port = self.effective_port(svc);
         let (stop_tx, stop_rx) = crossbeam_channel::bounded(1);
         let entry = self.handles.entry(svc).or_insert_with(|| {
             let (kill_tx, _) = crossbeam_channel::bounded(1);
@@ -79,20 +94,63 @@ impl Executor {
     }
 
     fn do_spawn(&mut self, svc: Service) {
-        let port = self.port(svc);
+        let configured = self.port(svc);
 
-        // Pre-check port
-        if !check_port_available(port) {
-            let _ = self.tx.send(Event::PortConflictDetected(svc));
+        // Scan upward for a free port. None → every port in the range is occupied.
+        let chosen = match find_available_port(configured, PORT_SCAN_RANGE) {
+            Some(p) => p,
+            None => {
+                let _ = self.tx.send(Event::PortConflictDetected(svc));
+                return;
+            }
+        };
+
+        // Always regenerate the service config file from the chosen port. This is
+        // critical: skipping the rewrite when chosen == configured leaves any stale
+        // config on disk (e.g. Listen 127.0.0.1:8081 from a previous crash-loop run)
+        // pointing at a different port than the one we'll probe for readiness, which
+        // turns into a phantom crash loop. PHP doesn't need a config rewrite — its
+        // port is a CLI flag.
+        let result = match svc {
+            Service::Apache => {
+                let php_port = self.effective_port(Service::Php);
+                rewrite_httpd_conf_with_ports(&self.config, chosen, php_port)
+            }
+            Service::Mysql => rewrite_my_ini_with_port(&self.config, chosen),
+            Service::Php => Ok(()),
+        };
+        if let Err(reason) = result {
+            let _ = self.tx.send(Event::ProcessSpawnFailed {
+                service: svc,
+                reason: format!("config regen for port {chosen}: {reason}"),
+            });
             return;
         }
+
+        // If this is PHP and Apache is currently running, refresh httpd.conf so the
+        // FastCGI proxy points at PHP's chosen port. Apache stays on its current port.
+        if svc == Service::Php && self.handles.contains_key(&Service::Apache) {
+            let apache_port = self.effective_port(Service::Apache);
+            if let Err(reason) = rewrite_httpd_conf_with_ports(&self.config, apache_port, chosen) {
+                self.log.push(format!(
+                    "warn: could not refresh httpd.conf for new PHP port: {reason}"
+                ));
+            }
+        }
+
+        // Record the resolution before spawn so later emits/queries see it.
+        self.effective_ports.insert(svc, chosen);
+        let _ = self.tx.send(Event::PortAssigned {
+            service: svc,
+            port: chosen,
+        });
 
         // Kill any existing handles for this service
         self.do_kill(svc);
 
         let (kill_tx, kill_rx) = crossbeam_channel::bounded::<()>(1);
 
-        match spawn_service(svc, &self.config, self.tx.clone()) {
+        match spawn_service(svc, &self.config, chosen, self.tx.clone()) {
             Ok(proc) => {
                 let tx = self.tx.clone();
                 let join = std::thread::spawn(move || watcher(proc, tx, kill_rx));
@@ -131,7 +189,7 @@ impl Executor {
     }
 
     fn do_readiness_check(&self, svc: Service) {
-        let port = self.port(svc);
+        let port = self.effective_port(svc);
         let tx = self.tx.clone();
         std::thread::spawn(move || poll_until_ready(svc, port, tx));
     }

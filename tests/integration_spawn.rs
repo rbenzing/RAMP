@@ -60,9 +60,9 @@ fn spawn_rejects_binary_outside_install_dir() {
     // Config with install_dir = tmp, but apache.bin = cmd.exe (outside tmp)
     let mut cfg = make_config(cmd_exe());
     cfg.install_dir = tmp.path().to_path_buf();
-    // apache.bin is now cmd.exe which is outside install_dir — validation must fail
+    // apache.bin is now cmd.exe which is outside install_dir â€” validation must fail
     let (tx, _rx) = unbounded();
-    let result = spawn_service(Service::Apache, &cfg, tx);
+    let result = spawn_service(Service::Apache, &cfg, cfg.apache.port, tx);
     assert!(
         result.is_err(),
         "expected error for binary outside install_dir"
@@ -105,12 +105,13 @@ fn spawn_and_kill_via_job_object() {
 
     let (_tmp, cfg) = make_spawn_env();
     let (tx, _rx) = unbounded();
-    let proc = spawn_service(Service::Apache, &cfg, tx).expect("spawn should succeed");
+    let proc =
+        spawn_service(Service::Apache, &cfg, cfg.apache.port, tx).expect("spawn should succeed");
 
-    // Process is running — try_wait should return None immediately
+    // Process is running â€” try_wait should return None immediately
     assert!(proc.try_wait().is_none(), "process should still be running");
 
-    // Kill via Job Object — must not hang or panic
+    // Kill via Job Object â€” must not hang or panic
     proc.kill();
     // Reaching here means kill() completed and WaitForSingleObject returned
 }
@@ -124,7 +125,7 @@ fn process_exits_after_kill() {
 
     let (_tmp, cfg) = make_spawn_env();
     let (tx, _rx) = unbounded();
-    let proc = spawn_service(Service::Apache, &cfg, tx).expect("spawn");
+    let proc = spawn_service(Service::Apache, &cfg, cfg.apache.port, tx).expect("spawn");
 
     // Kill blocks until the OS confirms the process is dead
     proc.kill();
@@ -154,16 +155,16 @@ fn port_available_reflects_bind_state() {
 }
 
 /// check_port_available returns false for a port that nothing is listening on
-/// but which is in TIME_WAIT — actually we can't reliably produce TIME_WAIT in a unit test.
+/// but which is in TIME_WAIT â€” actually we can't reliably produce TIME_WAIT in a unit test.
 /// Instead verify that an unused high port reports as available.
 #[test]
 fn unused_high_port_is_available() {
     // Port 59999 is unlikely to be in use during tests
-    // If this flakes in CI, the test can be skipped — it's a smoke test
+    // If this flakes in CI, the test can be skipped â€” it's a smoke test
     assert!(check_port_available(59999));
 }
 
-/// Exit codes are reported as u32 — Windows crash codes like 0xC0000005 (access violation)
+/// Exit codes are reported as u32 â€” Windows crash codes like 0xC0000005 (access violation)
 /// must not be truncated or sign-extended to negative values.
 /// try_wait returns u32, and Event::ProcessExit.exit_code is Option<u32>.
 #[test]
@@ -179,7 +180,7 @@ fn exit_code_is_u32_no_sign_extension() {
     };
     if let Event::ProcessExit { exit_code, .. } = event {
         let reported = exit_code.unwrap();
-        // Must equal the original value — no truncation, no sign extension
+        // Must equal the original value â€” no truncation, no sign extension
         assert_eq!(reported, 0xC000_0005u32);
         // Confirm it would have been wrong as i32 (to prove the fix matters)
         assert!(reported > i32::MAX as u32);
@@ -189,7 +190,7 @@ fn exit_code_is_u32_no_sign_extension() {
 }
 
 /// Spawn a process, kill it, then immediately spawn again.
-/// The second spawn must succeed — no stale ProcessExit from the first kill
+/// The second spawn must succeed â€” no stale ProcessExit from the first kill
 /// should race with the reducer's Starting state.
 ///
 /// Before the H1 fix, do_kill dropped the watcher JoinHandle without joining,
@@ -207,13 +208,15 @@ fn kill_then_respawn_no_stale_process_exit() {
 
     // First spawn
     let (tx, rx) = unbounded();
-    let proc1 = spawn_service(Service::Apache, &cfg, tx.clone()).expect("first spawn");
+    let proc1 =
+        spawn_service(Service::Apache, &cfg, cfg.apache.port, tx.clone()).expect("first spawn");
 
     // Kill synchronously (mirrors what do_kill does after the fix: signal + join)
     proc1.kill();
 
-    // Second spawn — must succeed
-    let proc2 = spawn_service(Service::Apache, &cfg, tx).expect("second spawn after kill");
+    // Second spawn â€” must succeed
+    let proc2 =
+        spawn_service(Service::Apache, &cfg, cfg.apache.port, tx).expect("second spawn after kill");
 
     // Drain any events: there must be no ProcessExit with Some(exit_code) that could
     // confuse a reducer that just moved to Starting for the second spawn.
@@ -255,7 +258,7 @@ fn spawn_rejects_nonexistent_binary() {
     cfg.apache.bin = tmp.path().join("nonexistent.exe");
 
     let (tx, _rx) = unbounded();
-    let result = spawn_service(Service::Apache, &cfg, tx);
+    let result = spawn_service(Service::Apache, &cfg, cfg.apache.port, tx);
     assert!(result.is_err(), "should reject non-existent binary");
     let msg = result.err().unwrap();
     assert!(
@@ -296,10 +299,10 @@ fn try_wait_reflects_process_lifecycle() {
     let (_tmp, cfg) = make_spawn_env();
     let (tx, _rx) = unbounded();
 
-    // cmd.exe waits for stdin input, so it stays alive — verify try_wait returns None.
-    let proc = spawn_service(Service::Apache, &cfg, tx).expect("spawn");
+    // cmd.exe waits for stdin input, so it stays alive â€” verify try_wait returns None.
+    let proc = spawn_service(Service::Apache, &cfg, cfg.apache.port, tx).expect("spawn");
 
-    // cmd.exe is waiting for stdin input — should still be running
+    // cmd.exe is waiting for stdin input â€” should still be running
     assert!(
         proc.try_wait().is_none(),
         "running process should return None"
